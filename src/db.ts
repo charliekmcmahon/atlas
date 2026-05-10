@@ -37,6 +37,20 @@ export interface Reminder {
   cancelledAt: string | null;
 }
 
+export interface AgentTask {
+  id: number;
+  contact: string;
+  chatId: string | null;
+  name: string;
+  payload: string | null; // JSON string
+  schedule: string | null; // cron expression for recurring tasks
+  nextRunAt: string | null; // ISO timestamp for next run
+  lastRunAt: string | null; // ISO timestamp of last run
+  isRecurring: boolean;
+  createdAt: string;
+  cancelledAt: string | null;
+}
+
 interface IncomingMessageRecord {
   messageId: string;
   contact: string;
@@ -297,6 +311,148 @@ export class MemoryStore {
     };
   }
 
+  createAgentTask(input: {
+    contact: string;
+    chatId: string | null;
+    name: string;
+    payload: string | null;
+    schedule: string | null;
+    nextRunAt: string | null;
+    isRecurring: boolean;
+  }): AgentTask {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `
+      INSERT INTO agent_tasks (contact, chat_id, name, payload, schedule, next_run_at, is_recurring, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    );
+    const result = stmt.run(
+      input.contact,
+      input.chatId,
+      input.name,
+      input.payload,
+      input.schedule,
+      input.nextRunAt,
+      input.isRecurring ? 1 : 0,
+      now
+    );
+    const id = Number(result.lastInsertRowid);
+    return {
+      id,
+      contact: input.contact,
+      chatId: input.chatId,
+      name: input.name,
+      payload: input.payload,
+      schedule: input.schedule,
+      nextRunAt: input.nextRunAt,
+      lastRunAt: null,
+      isRecurring: input.isRecurring,
+      createdAt: now,
+      cancelledAt: null,
+    };
+  }
+
+  listActiveAgentTasks(contact: string): AgentTask[] {
+    const stmt = this.db.prepare(
+      `
+      SELECT id, contact, chat_id, name, payload, schedule, next_run_at, last_run_at, is_recurring, created_at, cancelled_at
+      FROM agent_tasks
+      WHERE contact = ?
+        AND cancelled_at IS NULL
+      ORDER BY datetime(next_run_at) ASC
+      `
+    );
+    const rows = stmt.all(contact) as Array<{
+      id: number;
+      contact: string;
+      chat_id: string | null;
+      name: string;
+      payload: string | null;
+      schedule: string | null;
+      next_run_at: string | null;
+      last_run_at: string | null;
+      is_recurring: number;
+      created_at: string;
+      cancelled_at: string | null;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      contact: r.contact,
+      chatId: r.chat_id,
+      name: r.name,
+      payload: r.payload,
+      schedule: r.schedule,
+      nextRunAt: r.next_run_at,
+      lastRunAt: r.last_run_at,
+      isRecurring: Boolean(r.is_recurring),
+      createdAt: r.created_at,
+      cancelledAt: r.cancelled_at,
+    }));
+  }
+
+  getDueAgentTasks(nowIso: string): AgentTask[] {
+    const stmt = this.db.prepare(
+      `
+      SELECT id, contact, chat_id, name, payload, schedule, next_run_at, last_run_at, is_recurring, created_at, cancelled_at
+      FROM agent_tasks
+      WHERE cancelled_at IS NULL
+        AND next_run_at IS NOT NULL
+        AND datetime(next_run_at) <= datetime(?)
+      ORDER BY datetime(next_run_at) ASC
+      `
+    );
+    const rows = stmt.all(nowIso) as Array<{
+      id: number;
+      contact: string;
+      chat_id: string | null;
+      name: string;
+      payload: string | null;
+      schedule: string | null;
+      next_run_at: string | null;
+      last_run_at: string | null;
+      is_recurring: number;
+      created_at: string;
+      cancelled_at: string | null;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      contact: r.contact,
+      chatId: r.chat_id,
+      name: r.name,
+      payload: r.payload,
+      schedule: r.schedule,
+      nextRunAt: r.next_run_at,
+      lastRunAt: r.last_run_at,
+      isRecurring: Boolean(r.is_recurring),
+      createdAt: r.created_at,
+      cancelledAt: r.cancelled_at,
+    }));
+  }
+
+  markAgentTaskRun(id: number, lastRunAtIso: string, nextRunAtIso: string | null): void {
+    const stmt = this.db.prepare(
+      `UPDATE agent_tasks SET last_run_at = ?, next_run_at = ?, cancelled_at = CASE WHEN next_run_at IS NULL AND is_recurring = 0 THEN ? ELSE cancelled_at END WHERE id = ?`
+    );
+    // If nextRunAtIso is null and not recurring, set cancelled_at to now to mark finished
+    const cancelledAt = nextRunAtIso === null ? new Date().toISOString() : null;
+    stmt.run(lastRunAtIso, nextRunAtIso, cancelledAt, id);
+  }
+
+  cancelAgentTask(contact: string, id: number): boolean {
+    const stmt = this.db.prepare(
+      `
+      UPDATE agent_tasks
+      SET cancelled_at = ?
+      WHERE id = ?
+        AND contact = ?
+        AND cancelled_at IS NULL
+      `
+    );
+    const result = stmt.run(new Date().toISOString(), id, contact);
+    return result.changes > 0;
+  }
+
   listPendingReminders(contact: string): Reminder[] {
     const stmt = this.db.prepare(
       `
@@ -432,6 +588,20 @@ export class MemoryStore {
         cancelled_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS agent_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contact TEXT NOT NULL,
+        chat_id TEXT,
+        name TEXT NOT NULL,
+        payload TEXT,
+        schedule TEXT,
+        next_run_at TEXT,
+        last_run_at TEXT,
+        is_recurring INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        cancelled_at TEXT
+      );
+
       CREATE INDEX IF NOT EXISTS idx_messages_contact_created
         ON messages(contact, datetime(created_at) DESC);
 
@@ -441,6 +611,10 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_reminders_pending_due
         ON reminders(due_at)
         WHERE sent_at IS NULL AND cancelled_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_agent_tasks_next_run
+        ON agent_tasks(next_run_at)
+        WHERE cancelled_at IS NULL AND next_run_at IS NOT NULL;
     `);
   }
 

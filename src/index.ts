@@ -18,6 +18,7 @@ import { MemoryStore, type Reminder } from "./db.js";
 import { buildSystemPrompt, buildUserContext } from "./prompt.js";
 import { ReminderScheduler } from "./scheduler.js";
 import { runToolCall, toolDeclarations } from "./tools.js";
+import { AgentTaskScheduler } from "./agent-tasks.js";
 import { IMessageClient, type IMessage, type SseEvent } from "./imessage-client.js";
 
 type BotMode = "imessage" | "cli";
@@ -43,6 +44,7 @@ let memoryClosed = false;
 let isShuttingDown = false;
 let stopSubscription: (() => void) | null = null;
 let scheduler: ReminderScheduler | null = null;
+let agentScheduler: AgentTaskScheduler | null = null;
 let queue: Promise<void> = Promise.resolve();
 
 function enqueue(task: () => Promise<void>): void {
@@ -335,6 +337,12 @@ function formatReminderForDelivery(reminder: Reminder): string {
   return `reminder: ${reminder.text}`;
 }
 
+function formatAgentTaskForDelivery(task: { name: string; payload: string | null }, resultText: string): string {
+  const header = `task: ${task.name}`;
+  if (!resultText || resultText.trim().length === 0) return header;
+  return `${header}\n${resultText}`;
+}
+
 async function deliverReminderToIMessage(reminder: Reminder): Promise<void> {
   const body = formatReminderForDelivery(reminder);
   for (const chunk of splitForIMessage(body, appConfig.maxIMessageChunk)) {
@@ -348,6 +356,67 @@ async function deliverReminderToIMessage(reminder: Reminder): Promise<void> {
     });
   }
   console.log(`[atlas] reminder #${reminder.id} delivered: "${reminder.text}"`);
+}
+
+async function deliverAgentTaskToIMessage(task: import("./db.js").AgentTask): Promise<void> {
+  const toolCtx = { contact: task.contact, chatId: task.chatId, store: memoryStore };
+  let resultText = "(no output)";
+
+  if (task.payload) {
+    try {
+      const parsed = JSON.parse(task.payload);
+      if (parsed && typeof parsed === "object" && parsed.tool) {
+        const res = await runToolCall(parsed.tool, parsed.args ?? {}, toolCtx);
+        resultText = JSON.stringify(res.payload, null, 2);
+      } else {
+        resultText = String(task.payload);
+      }
+    } catch (error) {
+      resultText = `task payload parse error: ${toErrorMessage(error)}`;
+    }
+  }
+
+  const body = formatAgentTaskForDelivery(task, resultText);
+  for (const chunk of splitForIMessage(body, appConfig.maxIMessageChunk)) {
+    await imessage.send(task.contact, chunk);
+    memoryStore.storeAssistantMessage({
+      messageId: createLocalMessageId(),
+      contact: task.contact,
+      chatId: task.chatId,
+      text: chunk,
+      createdAt: new Date().toISOString(),
+    });
+  }
+  console.log(`[atlas] agent task #${task.id} delivered: "${task.name}"`);
+}
+
+async function deliverAgentTaskToCli(task: import("./db.js").AgentTask): Promise<void> {
+  const toolCtx = { contact: task.contact, chatId: task.chatId, store: memoryStore };
+  let resultText = "(no output)";
+
+  if (task.payload) {
+    try {
+      const parsed = JSON.parse(task.payload);
+      if (parsed && typeof parsed === "object" && parsed.tool) {
+        const res = await runToolCall(parsed.tool, parsed.args ?? {}, toolCtx);
+        resultText = JSON.stringify(res.payload, null, 2);
+      } else {
+        resultText = String(task.payload);
+      }
+    } catch (error) {
+      resultText = `task payload parse error: ${toErrorMessage(error)}`;
+    }
+  }
+
+  const body = formatAgentTaskForDelivery(task, resultText);
+  console.log(`\n[atlas] ${body}`);
+  memoryStore.storeAssistantMessage({
+    messageId: createLocalMessageId(),
+    contact: task.contact,
+    chatId: task.chatId,
+    text: body,
+    createdAt: new Date().toISOString(),
+  });
 }
 
 async function deliverReminderToCli(reminder: Reminder): Promise<void> {
@@ -413,6 +482,14 @@ async function startIMessageMode(): Promise<void> {
   scheduler.start();
   console.log(`[atlas] reminder scheduler started (tick: ${appConfig.reminderTickMs}ms)`);
 
+  agentScheduler = new AgentTaskScheduler({
+    store: memoryStore,
+    deliver: deliverAgentTaskToIMessage,
+    intervalMs: appConfig.agentTaskTickMs ?? appConfig.reminderTickMs,
+  });
+  agentScheduler.start();
+  console.log(`[atlas] agent task scheduler started (tick: ${appConfig.agentTaskTickMs ?? appConfig.reminderTickMs}ms)`);
+
   // Pick the boot greeting:
   //   - post-reboot (supervisor set ATLAS_REBOOTING=1) → "back online!"
   //   - cold start with STARTUP_MESSAGE configured → that message
@@ -468,6 +545,13 @@ async function startCliMode(): Promise<void> {
     intervalMs: appConfig.reminderTickMs,
   });
   scheduler.start();
+
+  agentScheduler = new AgentTaskScheduler({
+    store: memoryStore,
+    deliver: deliverAgentTaskToCli,
+    intervalMs: appConfig.agentTaskTickMs ?? appConfig.reminderTickMs,
+  });
+  agentScheduler.start();
 
   console.log(`[atlas] cli contact id: ${contact}`);
   console.log("[atlas] commands: /help, /file <path>, /files, /clearfiles, /exit");

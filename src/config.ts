@@ -56,5 +56,8 @@ export const appConfig = {
   // How often the reminder scheduler polls for due reminders.
   reminderTickMs: toPositiveInt(process.env.REMINDER_TICK_MS, 30_000),
 
+  // How often the agent task scheduler polls for due tasks. If unset, falls back to reminderTickMs.
+  agentTaskTickMs: process.env.AGENT_TASK_TICK_MS ? toPositiveInt(process.env.AGENT_TASK_TICK_MS, 30_000) : undefined,
+
   debug: toBool(process.env.DEBUG, false),
 } as const;
