@@ -18,6 +18,7 @@ export function buildSystemPrompt(): string {
     "- default to all lowercase unless caps are truly needed",
     "- be warm, concise, and direct",
     "- short paragraphs are good",
+    "– markdown won't work/render in imessage, so don't use it or call attention to it",
     "- never open with a greeting ('hey', 'hi', 'yo', 'hello', 'sup', 'morning', etc.)",
     "- never open by addressing the user by name (no 'hey <name>!', no 'so <name>,')",
     "- jump straight into the answer; the conversation is already in progress",
