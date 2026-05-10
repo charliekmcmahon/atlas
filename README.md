@@ -5,10 +5,12 @@ allowlisted contact, generates a reply with Gemini, and sends it back over
 iMessage. Includes per-contact long-term memory in SQLite.
 
 Atlas does **not** talk to `chat.db` or `osascript` directly. It is a thin
-client of `imessage-api-catalina` — a separate local-network REST + SSE server that
-owns the Messages.app integration. This separation means atlas itself is a
-portable, public-friendly Node service: the macOS-specific plumbing lives in
-imessage-api-catalina, the Gemini logic lives here.
+client of [`imessage-api-catalina`][api] — a separate local-network REST +
+SSE server that owns the Messages.app integration. This separation means
+atlas itself is a portable, public-friendly Node service: the macOS-specific
+plumbing lives in imessage-api-catalina, the Gemini logic lives here.
+
+[api]: https://github.com/charliekmcmahon/imessage-api-catalina
 
 ```
 ┌────────────┐   SSE /events    ┌─────────────────────────┐   AppleScript   ┌──────────────┐
@@ -37,8 +39,9 @@ imessage-api-catalina, the Gemini logic lives here.
 ## Requirements
 
 - Node.js 18+
-- A running `imessage-api-catalina` instance (typically on the same Mac that owns the
-  Apple ID — atlas itself can run anywhere that can reach it)
+- A running [`imessage-api-catalina`][api] instance (typically on the same
+  Mac that owns the Apple ID — atlas itself can run anywhere that can reach
+  it)
 - A Gemini API key
 
 ## Install
