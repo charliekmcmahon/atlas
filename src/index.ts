@@ -9,12 +9,15 @@ import {
   createPartFromText,
   createPartFromUri,
   createUserContent,
+  type Content,
   type Part,
 } from "@google/genai";
 
 import { appConfig } from "./config.js";
-import { MemoryStore } from "./db.js";
+import { MemoryStore, type Reminder } from "./db.js";
 import { buildSystemPrompt, buildUserContext } from "./prompt.js";
+import { ReminderScheduler } from "./scheduler.js";
+import { runToolCall, toolDeclarations } from "./tools.js";
 import { IMessageClient, type IMessage, type SseEvent } from "./imessage-client.js";
 
 type BotMode = "imessage" | "cli";
@@ -25,6 +28,8 @@ interface AttachmentInput {
   fileName: string | null;
   mimeType: string | null;
 }
+
+const MAX_TOOL_ITERATIONS = 5;
 
 const ai = new GoogleGenAI({ apiKey: appConfig.geminiApiKey });
 const memoryStore = new MemoryStore(appConfig.dbPath);
@@ -37,6 +42,7 @@ let cliInterface: ReadlineInterface | null = null;
 let memoryClosed = false;
 let isShuttingDown = false;
 let stopSubscription: (() => void) | null = null;
+let scheduler: ReminderScheduler | null = null;
 let queue: Promise<void> = Promise.resolve();
 
 function enqueue(task: () => Promise<void>): void {
@@ -82,7 +88,7 @@ async function handleInbound(message: IMessage): Promise<void> {
   memoryStore.extractAndStoreMemories(contact, text, messageId);
   memoryStore.markMessageRead(messageId, new Date().toISOString());
 
-  const reply = await generateAssistantReply(contact, text, []);
+  const reply = await generateAssistantReply(contact, message.chatId, text, []);
 
   for (const chunk of splitForIMessage(reply, appConfig.maxIMessageChunk)) {
     await imessage.send(contact, chunk);
@@ -128,6 +134,7 @@ async function maybeHandleCommand(contact: string, rawText: string): Promise<boo
 
 async function generateAssistantReply(
   contact: string,
+  chatId: string | null,
   latestUserText: string,
   attachments: readonly AttachmentInput[]
 ): Promise<string> {
@@ -139,25 +146,76 @@ async function generateAssistantReply(
     memories: memoryStore.getMemories(contact, 8),
     recentConversation: memoryStore.recentConversation(contact, 14),
     attachmentSummaries: summaries,
+    profile: memoryStore.getProfile(contact),
   });
 
-  const response = await ai.models.generateContentStream({
-    model: appConfig.geminiModel,
-    config: {
-      systemInstruction: buildSystemPrompt(),
-      tools: [{ googleSearch: {} }],
-    },
-    contents: [createUserContent([createPartFromText(promptText), ...attachmentParts])],
-  });
+  const contents: Content[] = [
+    createUserContent([createPartFromText(promptText), ...attachmentParts]),
+  ];
 
-  let reply = "";
-  for await (const chunk of response) {
-    if (chunk.text) {
-      reply += chunk.text;
+  const toolCtx = { contact, chatId, store: memoryStore };
+  let finalText = "";
+
+  for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
+    const response = await ai.models.generateContent({
+      model: appConfig.geminiModel,
+      config: {
+        systemInstruction: buildSystemPrompt(),
+        tools: [{ functionDeclarations: toolDeclarations }],
+      },
+      contents,
+    });
+
+    const candidate = response.candidates?.[0];
+    const parts: Part[] = candidate?.content?.parts ?? [];
+    const functionCalls = parts.filter((part) => part.functionCall);
+
+    if (functionCalls.length === 0) {
+      finalText = parts
+        .map((part) => part.text ?? "")
+        .filter((text) => text.length > 0)
+        .join("");
+      break;
     }
+
+    if (candidate?.content) {
+      contents.push(candidate.content);
+    }
+
+    const responseParts: Part[] = [];
+    for (const part of functionCalls) {
+      const call = part.functionCall;
+      if (!call?.name) continue;
+
+      const args = (call.args ?? {}) as Record<string, unknown>;
+      let result;
+      try {
+        result = await runToolCall(call.name, args, toolCtx);
+      } catch (error) {
+        result = {
+          payload: { error: toErrorMessage(error) },
+          log: `tool ${call.name} threw: ${toErrorMessage(error)}`,
+        };
+      }
+
+      if (result.log) {
+        console.log(`[atlas] tool ${call.name}: ${result.log}`);
+      } else if (appConfig.debug) {
+        console.log(`[atlas] tool ${call.name} called`);
+      }
+
+      responseParts.push({
+        functionResponse: {
+          name: call.name,
+          response: result.payload,
+        },
+      });
+    }
+
+    contents.push({ role: "user", parts: responseParts });
   }
 
-  return finalizeReply(reply);
+  return finalizeReply(finalText);
 }
 
 async function buildAttachmentParts(
@@ -273,6 +331,37 @@ function toErrorMessage(error: unknown): string {
   return String(error);
 }
 
+function formatReminderForDelivery(reminder: Reminder): string {
+  return `reminder: ${reminder.text}`;
+}
+
+async function deliverReminderToIMessage(reminder: Reminder): Promise<void> {
+  const body = formatReminderForDelivery(reminder);
+  for (const chunk of splitForIMessage(body, appConfig.maxIMessageChunk)) {
+    await imessage.send(reminder.contact, chunk);
+    memoryStore.storeAssistantMessage({
+      messageId: createLocalMessageId(),
+      contact: reminder.contact,
+      chatId: reminder.chatId,
+      text: chunk,
+      createdAt: new Date().toISOString(),
+    });
+  }
+  console.log(`[atlas] reminder #${reminder.id} delivered: "${reminder.text}"`);
+}
+
+async function deliverReminderToCli(reminder: Reminder): Promise<void> {
+  const body = formatReminderForDelivery(reminder);
+  console.log(`\n[atlas] ${body}`);
+  memoryStore.storeAssistantMessage({
+    messageId: createLocalMessageId(),
+    contact: reminder.contact,
+    chatId: reminder.chatId,
+    text: body,
+    createdAt: new Date().toISOString(),
+  });
+}
+
 async function start(): Promise<void> {
   const mode = resolveMode();
   console.log(`[atlas] mode: ${mode}`);
@@ -293,6 +382,7 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
   console.log(`[atlas] shutting down (${signal}, exit=${exitCode})`);
   cliInterface?.close();
   stopSubscription?.();
+  scheduler?.stop();
 
   await Promise.allSettled([queue, Promise.resolve().then(() => closeMemoryStore())]);
   process.exit(exitCode);
@@ -314,6 +404,14 @@ async function startIMessageMode(): Promise<void> {
   } catch (error) {
     throw new Error(`imessage api not reachable at ${appConfig.imessageApiUrl}: ${toErrorMessage(error)}`);
   }
+
+  scheduler = new ReminderScheduler({
+    store: memoryStore,
+    deliver: deliverReminderToIMessage,
+    intervalMs: appConfig.reminderTickMs,
+  });
+  scheduler.start();
+  console.log(`[atlas] reminder scheduler started (tick: ${appConfig.reminderTickMs}ms)`);
 
   // Pick the boot greeting:
   //   - post-reboot (supervisor set ATLAS_REBOOTING=1) → "back online!"
@@ -363,6 +461,13 @@ async function startCliMode(): Promise<void> {
   const pendingAttachments: string[] = [];
 
   cliInterface = createInterface({ input: process.stdin, output: process.stdout });
+
+  scheduler = new ReminderScheduler({
+    store: memoryStore,
+    deliver: deliverReminderToCli,
+    intervalMs: appConfig.reminderTickMs,
+  });
+  scheduler.start();
 
   console.log(`[atlas] cli contact id: ${contact}`);
   console.log("[atlas] commands: /help, /file <path>, /files, /clearfiles, /exit");
@@ -435,7 +540,7 @@ async function startCliMode(): Promise<void> {
     console.log("[atlas] thinking...");
 
     try {
-      const reply = await generateAssistantReply(contact, line, toCliAttachmentInputs(attachmentPaths));
+      const reply = await generateAssistantReply(contact, "cli", line, toCliAttachmentInputs(attachmentPaths));
       console.log(`bot> ${reply}\n`);
 
       for (const chunk of splitForIMessage(reply, appConfig.maxIMessageChunk)) {

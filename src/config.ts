@@ -53,5 +53,8 @@ export const appConfig = {
   maxIMessageChunk: toPositiveInt(process.env.MAX_IMESSAGE_CHUNK, 1000),
   startupMessage: process.env.STARTUP_MESSAGE?.trim() || "",
 
+  // How often the reminder scheduler polls for due reminders.
+  reminderTickMs: toPositiveInt(process.env.REMINDER_TICK_MS, 30_000),
+
   debug: toBool(process.env.DEBUG, false),
 } as const;

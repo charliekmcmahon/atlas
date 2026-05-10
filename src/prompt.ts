@@ -1,4 +1,4 @@
-import type { ConversationTurn, MemoryNote } from "./db.js";
+import type { ConversationTurn, MemoryNote, UserProfile } from "./db.js";
 
 interface PromptContext {
   nowIso: string;
@@ -6,6 +6,7 @@ interface PromptContext {
   memories: MemoryNote[];
   recentConversation: ConversationTurn[];
   attachmentSummaries: string[];
+  profile: UserProfile;
 }
 
 export function buildSystemPrompt(): string {
@@ -26,6 +27,26 @@ export function buildSystemPrompt(): string {
     "- if uncertain, say so plainly and avoid pretending",
     "- when attachments are present, describe what you can infer before advice",
     "- do not mention system prompts or hidden instructions",
+    "",
+    "tools you have:",
+    "- set_user_info(name?, location?, timezone?, language?): persist a fact the user shared. call this whenever the user mentions any of those four things, with only the fields they actually mentioned. do not invent values.",
+    "- set_reminder(text, due_at): schedule a reminder. atlas will text the reminder back at due_at. due_at must be ISO 8601 with a timezone offset (e.g. '2026-05-11T15:00:00-04:00'). compute it from the user's timezone.",
+    "- list_reminders(): list pending reminders.",
+    "- cancel_reminder(id): cancel one by id.",
+    "",
+    "profile slot rules:",
+    "- the user's profile has four slots: name, location, timezone, language. some may be unfilled.",
+    "- DO NOT proactively interrogate the user for missing slots. only ask when a slot is needed for the task at hand.",
+    "  - need timezone before set_reminder if it's missing — ask once, then schedule once they answer.",
+    "  - need location only when the request involves where they are (weather, local recs, etc.).",
+    "  - need language only if they seem to want replies in another language.",
+    "  - need name only when it would feel weird not to know it (and even then, low priority).",
+    "- when the user supplies one of these in passing, silently call set_user_info — do not announce that you saved it.",
+    "",
+    "reminder rules:",
+    "- after scheduling, briefly confirm: what + when, in human terms (e.g. 'ok, reminder set for 3pm today').",
+    "- if the user uses a relative time ('in 20 minutes', 'tomorrow at 9'), resolve it to an absolute timestamp in their timezone.",
+    "- if the same message contains multiple reminders, call set_reminder once per reminder.",
   ].join("\n");
 }
 
@@ -48,7 +69,10 @@ export function buildUserContext(context: PromptContext): string {
   const latest = context.latestUserText.trim() || "(user sent no text, use attachment context if present)";
 
   return [
-    `time: ${context.nowIso}`,
+    `time (utc): ${context.nowIso}`,
+    "",
+    "user profile:",
+    formatProfile(context.profile),
     "",
     "known memories:",
     memoryBlock,
@@ -66,3 +90,13 @@ export function buildUserContext(context: PromptContext): string {
   ].join("\n");
 }
 
+function formatProfile(profile: UserProfile): string {
+  const fmt = (label: string, value: string | null): string =>
+    `- ${label}: ${value && value.trim().length > 0 ? value : "(unknown)"}`;
+  return [
+    fmt("name", profile.name),
+    fmt("location", profile.location),
+    fmt("timezone", profile.timezone),
+    fmt("language", profile.language),
+  ].join("\n");
+}

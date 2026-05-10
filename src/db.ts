@@ -16,6 +16,27 @@ export interface MemoryNote {
   updatedAt: string;
 }
 
+export interface UserProfile {
+  name: string | null;
+  location: string | null;
+  timezone: string | null;
+  language: string | null;
+  updatedAt: string | null;
+}
+
+export type ProfileField = keyof Omit<UserProfile, "updatedAt">;
+
+export interface Reminder {
+  id: number;
+  contact: string;
+  chatId: string | null;
+  text: string;
+  dueAt: string;
+  createdAt: string;
+  sentAt: string | null;
+  cancelledAt: string | null;
+}
+
 interface IncomingMessageRecord {
   messageId: string;
   contact: string;
@@ -37,6 +58,15 @@ interface ExtractedMemory {
   kind: string;
   note: string;
 }
+
+interface CreateReminderInput {
+  contact: string;
+  chatId: string | null;
+  text: string;
+  dueAt: string;
+}
+
+const PROFILE_FIELDS: readonly ProfileField[] = ["name", "location", "timezone", "language"];
 
 export class MemoryStore {
   private readonly db: Database.Database;
@@ -184,6 +214,175 @@ export class MemoryStore {
     return rows.map((row) => ({ kind: row.kind, note: row.note, updatedAt: row.updated_at }));
   }
 
+  getProfile(contact: string): UserProfile {
+    const stmt = this.db.prepare(
+      `SELECT name, location, timezone, language, updated_at FROM profiles WHERE contact = ?`
+    );
+    const row = stmt.get(contact) as
+      | {
+          name: string | null;
+          location: string | null;
+          timezone: string | null;
+          language: string | null;
+          updated_at: string | null;
+        }
+      | undefined;
+
+    if (!row) {
+      return { name: null, location: null, timezone: null, language: null, updatedAt: null };
+    }
+    return {
+      name: row.name,
+      location: row.location,
+      timezone: row.timezone,
+      language: row.language,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  setProfileFields(contact: string, fields: Partial<Record<ProfileField, string>>): UserProfile {
+    const provided = PROFILE_FIELDS.filter((field) => {
+      const value = fields[field];
+      return typeof value === "string" && value.trim().length > 0;
+    });
+
+    if (provided.length === 0) {
+      return this.getProfile(contact);
+    }
+
+    const now = new Date().toISOString();
+    const cleaned: Record<string, string> = {};
+    for (const field of provided) {
+      cleaned[field] = (fields[field] as string).trim();
+    }
+
+    const insertCols = ["contact", ...provided, "updated_at"];
+    const insertPlaceholders = insertCols.map(() => "?").join(", ");
+    const updateAssignments = [...provided.map((field) => `${field} = excluded.${field}`), "updated_at = excluded.updated_at"].join(", ");
+
+    const stmt = this.db.prepare(
+      `
+      INSERT INTO profiles (${insertCols.join(", ")})
+      VALUES (${insertPlaceholders})
+      ON CONFLICT(contact) DO UPDATE SET
+        ${updateAssignments}
+      `
+    );
+
+    const values: unknown[] = [contact, ...provided.map((field) => cleaned[field]), now];
+    stmt.run(...values);
+
+    return this.getProfile(contact);
+  }
+
+  createReminder(input: CreateReminderInput): Reminder {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `
+      INSERT INTO reminders (contact, chat_id, text, due_at, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      `
+    );
+    const result = stmt.run(input.contact, input.chatId, input.text, input.dueAt, now);
+    const id = Number(result.lastInsertRowid);
+    return {
+      id,
+      contact: input.contact,
+      chatId: input.chatId,
+      text: input.text,
+      dueAt: input.dueAt,
+      createdAt: now,
+      sentAt: null,
+      cancelledAt: null,
+    };
+  }
+
+  listPendingReminders(contact: string): Reminder[] {
+    const stmt = this.db.prepare(
+      `
+      SELECT id, contact, chat_id, text, due_at, created_at, sent_at, cancelled_at
+      FROM reminders
+      WHERE contact = ?
+        AND sent_at IS NULL
+        AND cancelled_at IS NULL
+      ORDER BY datetime(due_at) ASC
+      `
+    );
+    const rows = stmt.all(contact) as Array<{
+      id: number;
+      contact: string;
+      chat_id: string | null;
+      text: string;
+      due_at: string;
+      created_at: string;
+      sent_at: string | null;
+      cancelled_at: string | null;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      contact: row.contact,
+      chatId: row.chat_id,
+      text: row.text,
+      dueAt: row.due_at,
+      createdAt: row.created_at,
+      sentAt: row.sent_at,
+      cancelledAt: row.cancelled_at,
+    }));
+  }
+
+  getDueReminders(nowIso: string): Reminder[] {
+    const stmt = this.db.prepare(
+      `
+      SELECT id, contact, chat_id, text, due_at, created_at, sent_at, cancelled_at
+      FROM reminders
+      WHERE sent_at IS NULL
+        AND cancelled_at IS NULL
+        AND datetime(due_at) <= datetime(?)
+      ORDER BY datetime(due_at) ASC
+      `
+    );
+    const rows = stmt.all(nowIso) as Array<{
+      id: number;
+      contact: string;
+      chat_id: string | null;
+      text: string;
+      due_at: string;
+      created_at: string;
+      sent_at: string | null;
+      cancelled_at: string | null;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      contact: row.contact,
+      chatId: row.chat_id,
+      text: row.text,
+      dueAt: row.due_at,
+      createdAt: row.created_at,
+      sentAt: row.sent_at,
+      cancelledAt: row.cancelled_at,
+    }));
+  }
+
+  markReminderSent(id: number, sentAtIso: string): void {
+    const stmt = this.db.prepare(`UPDATE reminders SET sent_at = ? WHERE id = ?`);
+    stmt.run(sentAtIso, id);
+  }
+
+  cancelReminder(contact: string, id: number): boolean {
+    const stmt = this.db.prepare(
+      `
+      UPDATE reminders
+      SET cancelled_at = ?
+      WHERE id = ?
+        AND contact = ?
+        AND sent_at IS NULL
+        AND cancelled_at IS NULL
+      `
+    );
+    const result = stmt.run(new Date().toISOString(), id, contact);
+    return result.changes > 0;
+  }
+
   close(): void {
     this.db.close();
   }
@@ -213,11 +412,35 @@ export class MemoryStore {
         UNIQUE(contact, note)
       );
 
+      CREATE TABLE IF NOT EXISTS profiles (
+        contact TEXT PRIMARY KEY,
+        name TEXT,
+        location TEXT,
+        timezone TEXT,
+        language TEXT,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contact TEXT NOT NULL,
+        chat_id TEXT,
+        text TEXT NOT NULL,
+        due_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        sent_at TEXT,
+        cancelled_at TEXT
+      );
+
       CREATE INDEX IF NOT EXISTS idx_messages_contact_created
         ON messages(contact, datetime(created_at) DESC);
 
       CREATE INDEX IF NOT EXISTS idx_memories_contact_updated
         ON memories(contact, datetime(updated_at) DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_reminders_pending_due
+        ON reminders(due_at)
+        WHERE sent_at IS NULL AND cancelled_at IS NULL;
     `);
   }
 
