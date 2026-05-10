@@ -41,10 +41,11 @@ IMESSAGE_KEY=$(read_env IMESSAGE_API_KEY)
 IMESSAGE_URL=$(read_env IMESSAGE_API_URL)
 IMESSAGE_URL="${IMESSAGE_URL:-http://localhost:8787}"
 
-# Dependencies
+# Dependencies — production only (skips tsx/esbuild, which has prebuilt
+# binaries that fail to load on macOS 11 and earlier).
 if [ ! -d "$SCRIPT_DIR/node_modules/better-sqlite3" ]; then
   log "Installing dependencies..."
-  npm install --prefix "$SCRIPT_DIR"
+  npm install --omit=dev --prefix "$SCRIPT_DIR"
 fi
 
 # Rebuild native modules if compiled for the wrong CPU architecture
@@ -66,10 +67,8 @@ fi
 
 # Build TypeScript
 log "Building..."
-if ! "$SCRIPT_DIR/node_modules/.bin/tsc" -p "$SCRIPT_DIR/tsconfig.json"; then
-  warn "tsc build failed — falling back to tsx."
-  exec "$SCRIPT_DIR/node_modules/.bin/tsx" "$SCRIPT_DIR/src/index.ts" --mode=imessage
-fi
+"$SCRIPT_DIR/node_modules/.bin/tsc" -p "$SCRIPT_DIR/tsconfig.json" \
+  || die "tsc build failed. Inspect the error above."
 
 log "Starting atlas (iMessage mode). Log: $LOG_FILE"
 log "Press Ctrl+C to stop."
