@@ -219,47 +219,89 @@ async function handleGoogleSearch(args: Record<string, unknown>, ctx: ToolContex
   if (!query) return { payload: { ok: false, error: "query is required" } };
 
   try {
-    // Use the native search tool provided by the Google GenAI client when available.
-    // Fall back to any available search method names to be robust across SDK versions.
-    // Typing is intentionally loose because the SDK surface can vary.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let raw: any = null;
-    if (typeof (ai as any).tools?.search === "function") {
-      raw = await (ai as any).tools.search({ query, limit });
-    } else if (typeof (ai as any).search === "function") {
-      raw = await (ai as any).search({ query, limit });
-    } else if (typeof (ai as any).web?.search === "function") {
-      raw = await (ai as any).web.search({ query, limit });
-    } else {
-      throw new Error("Google GenAI search API not available in this SDK version");
-    }
+      // Perform a basic Google search by fetching and parsing the search results page.
+      // This is a simple fallback since the GenAI SDK doesn't expose a search API.
+      const encoded = encodeURIComponent(query);
+      const searchUrl = `https://www.google.com/search?q=${encoded}&num=${limit}`;
 
-    const resultsList = raw?.results ?? raw?.items ?? raw?.organic_results ?? [];
-    const top = (Array.isArray(resultsList) ? resultsList.slice(0, limit) : []).map((r: any) => ({
-      title: r.title ?? r.headline ?? r.name ?? "",
-      snippet: (r.snippet ?? r.snippet_text ?? r.snippetHtml ?? r.snippet) || "",
-      url: r.url ?? r.link ?? r.href ?? r.uri ?? "",
-    }));
+      const response = await fetch(searchUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`Google search HTTP ${response.status}`);
+      }
+
+      const html = await response.text();
+
+      // Simple regex-based parsing of Google search results
+      // Pattern: looks for result blocks with title, snippet, and URL
+      const resultPattern =
+        /<div[^>]*data-sokoban-container[^>]*>.*?<h3[^>]*><a[^>]*href="\/url\?q=([^&]+)[^"]*"[^>]*>([^<]+)<\/a><\/h3>.*?<div[^>]*style="[^"]*"[^>]*>([^<]*)<\/div>/gs;
+
+      const top: Array<{ title: string; snippet: string; url: string }> = [];
+      let match;
+      while ((match = resultPattern.exec(html)) && top.length < limit) {
+        try {
+          const url = decodeURIComponent(match[1]);
+          const title = match[2]?.replace(/<[^>]*>/g, "") || "";
+          const snippet = match[3]?.replace(/<[^>]*>/g, "").slice(0, 200) || "";
+
+          // Skip ads, "About" results, and other non-web results
+          if (
+            url &&
+            title &&
+            !url.includes("google.") &&
+            !title.toLowerCase().includes("related searches") &&
+            !title.toLowerCase().includes("searches related to")
+          ) {
+            top.push({ title: title.trim(), snippet: snippet.trim(), url });
+          }
+        } catch {
+          // Skip malformed results
+        }
+      }
+
+      if (top.length === 0) {
+        return {
+          payload: {
+            ok: true,
+            query,
+            results: [],
+            summary:
+              "No search results found. The model's knowledge may be limited or the query too specific. Try a simpler or more general query.",
+          },
+          log: `google_search: ${query} -> 0 results (parsing may have failed)`,
+        };
+      }
 
     // Ask Gemini to synthesize a short summary for the user
     const contents = [
       { role: "system", text: `You are a concise web search summarizer.` },
-      { role: "user", text: `Summarize the following search results for the query: ${query}\n\nResults:\n${top
-          .map((t: any) => `- ${t.title}: ${t.snippet} (${t.url})`)
-          .join("\n")}` },
+      {
+        role: "user",
+        text: `Summarize the following search results for the query: ${query}\n\nResults:\n${top
+          .map((t) => `- ${t.title}: ${t.snippet} (${t.url})`)
+          .join("\n")}`,
+      },
     ];
 
-    const response = await ai.models.generateContent({
+    const genResponse = await ai.models.generateContent({
       model: appConfig.geminiModel,
       config: { systemInstruction: "Summarize search results briefly and provide a short actionable answer." },
       contents,
     });
 
-    const summary = response.candidates?.[0]?.content?.parts?.map((p: any) => p.text ?? "").join("") ?? "";
+    const summary = genResponse.candidates?.[0]?.content?.parts?.map((p: any) => p.text ?? "").join("") ?? "";
 
     return { payload: { ok: true, query, results: top, summary }, log: `google_search: ${query} -> ${top.length} results` };
   } catch (error) {
-    return { payload: { ok: false, error: toErrorMessage(error) }, log: `google_search error: ${toErrorMessage(error)}` };
+    return {
+      payload: { ok: false, error: toErrorMessage(error) },
+      log: `google_search error: ${toErrorMessage(error)}`,
+    };
   }
 }
 
