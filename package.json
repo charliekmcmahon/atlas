@@ -1,7 +1,7 @@
 {
   "name": "atlas",
   "version": "1.0.0",
-  "description": "iMessage Gemini assistant bot",
+  "description": "iMessage chatbot powered by Gemini, fronted by the imessagekit local API",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx src/index.ts",
@@ -11,21 +11,26 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "imessage",
+    "gemini",
+    "chatbot"
+  ],
+  "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@google/genai": "^1.50.1",
-    "@photon-ai/imessage-kit": "^3.0.0",
-    "better-sqlite3": "^9.6.0",
-    "dotenv": "^17.4.2",
+    "better-sqlite3": "^11.5.0",
+    "dotenv": "^16.4.5",
     "mime": "^4.1.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^25.6.0",
+    "@types/node": "^22.0.0",
     "tsx": "^4.21.0",
-    "typescript": "^6.0.3"
+    "typescript": "^5.6.0"
   }
 }

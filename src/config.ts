@@ -26,19 +26,33 @@ function toPositiveInt(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function normalizeBaseUrl(url: string): string {
+  return url.replace(/\/+$/, "");
+}
+
 export const appConfig = {
   geminiApiKey: getRequiredEnv("GEMINI_API_KEY"),
+  geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash",
+
+  // The phone or Apple ID this bot will reply to. Must also be in the
+  // imessagekit server's ALLOWED_RECIPIENTS list, or sends will be rejected.
   allowedContact: process.env.ALLOWED_CONTACT?.trim() || "",
+
+  // imessagekit API
+  imessageApiUrl: normalizeBaseUrl(process.env.IMESSAGE_API_URL?.trim() || "http://localhost:8787"),
+  imessageApiKey: getRequiredEnv("IMESSAGE_API_KEY"),
+
+  // CLI mode contact id (used as the memory key for /run -- mode=cli sessions)
   cliContact: process.env.CLI_CONTACT?.trim() || "terminal-user",
-  model: process.env.GEMINI_MODEL?.trim() || "gemini-3-flash-preview",
+
+  // Local memory store
   dbPath: resolve(process.env.MEMORY_DB_PATH?.trim() || "./data/memories.sqlite"),
+
+  // Behavior
   sendEmojiReaction: toBool(process.env.SEND_EMOJI_REACTION, true),
   maxAttachmentBytes: toPositiveInt(process.env.MAX_ATTACHMENT_BYTES, 20 * 1024 * 1024),
+  maxIMessageChunk: toPositiveInt(process.env.MAX_IMESSAGE_CHUNK, 1000),
+  startupMessage: process.env.STARTUP_MESSAGE?.trim() || "",
+
   debug: toBool(process.env.DEBUG, false),
-  imessageApiKey: process.env.IMESSAGE_API_KEY?.trim() || "",
-  imessageApiUrls: (process.env.IMESSAGE_API_URLS?.trim() || "http://localhost:5000,http://192.168.0.49:5000")
-    .split(",")
-    .map((u) => u.trim())
-    .filter(Boolean),
-  pollIntervalMs: toPositiveInt(process.env.POLL_INTERVAL_MS, 3000),
 } as const;

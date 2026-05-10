@@ -15,8 +15,7 @@ import {
 import { appConfig } from "./config.js";
 import { MemoryStore } from "./db.js";
 import { buildSystemPrompt, buildUserContext, chooseReaction } from "./prompt.js";
-import { sendViaAppleScript } from "./imessage-client.js";
-import { getMaxRowId, getNewIncomingMessages } from "./messages-db.js";
+import { IMessageClient, type IMessage, type SseEvent } from "./imessage-client.js";
 
 type BotMode = "imessage" | "cli";
 
@@ -29,63 +28,73 @@ interface AttachmentInput {
 
 const ai = new GoogleGenAI({ apiKey: appConfig.geminiApiKey });
 const memoryStore = new MemoryStore(appConfig.dbPath);
+const imessage = new IMessageClient({
+  baseUrl: appConfig.imessageApiUrl,
+  apiKey: appConfig.imessageApiKey,
+});
 
 let cliInterface: ReadlineInterface | null = null;
 let memoryClosed = false;
 let isShuttingDown = false;
-let allowedContact = "";
-let queue = Promise.resolve();
+let stopSubscription: (() => void) | null = null;
+let queue: Promise<void> = Promise.resolve();
 
 function enqueue(task: () => Promise<void>): void {
   queue = queue.then(task).catch((error: unknown) => {
-    console.error("[bot] task failed:", toErrorMessage(error));
+    console.error("[atlas] task failed:", toErrorMessage(error));
   });
 }
 
-// Node 16 compatible readline question wrapper
 function questionAsync(rl: ReadlineInterface, prompt: string): Promise<string> {
   return new Promise((resolve) => rl.question(prompt, resolve));
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+async function handleInbound(message: IMessage): Promise<void> {
+  const contact = message.participant;
+  if (!contact) return;
+  if (appConfig.allowedContact && normalizeContact(contact) !== normalizeContact(appConfig.allowedContact)) {
+    if (appConfig.debug) {
+      console.log(`[atlas] ignoring inbound from non-allowed contact: ${contact}`);
+    }
+    return;
+  }
 
-async function handleMessage(contact: string, text: string, messageId: string): Promise<void> {
-  const nowIso = new Date().toISOString();
+  const text = message.text ?? "";
+  if (!text.trim()) return;
+
+  const messageId = message.id ?? `row-${message.rowId}`;
+  const nowIso = message.createdAt ?? new Date().toISOString();
 
   const inserted = memoryStore.registerIncomingMessage({
     messageId,
     contact,
-    chatId: null,
+    chatId: message.chatId,
     text,
-    hasAttachments: false,
+    hasAttachments: message.hasAttachments,
     createdAt: nowIso,
   });
 
-  if (!inserted) {
-    return;
-  }
+  if (!inserted) return; // already processed
 
   memoryStore.extractAndStoreMemories(contact, text, messageId);
-  memoryStore.markMessageRead(messageId, nowIso);
+  memoryStore.markMessageRead(messageId, new Date().toISOString());
 
   if (appConfig.sendEmojiReaction) {
     try {
-      await sendViaAppleScript(contact, chooseReaction(text, 0));
+      await imessage.send(contact, chooseReaction(text, 0));
     } catch (error) {
-      console.error("[bot] failed to send reaction:", toErrorMessage(error));
+      console.error("[atlas] failed to send reaction:", toErrorMessage(error));
     }
   }
 
   const reply = await generateAssistantReply(contact, text, []);
 
-  for (const chunk of splitForIMessage(reply, 1000)) {
-    await sendViaAppleScript(contact, chunk);
+  for (const chunk of splitForIMessage(reply, appConfig.maxIMessageChunk)) {
+    await imessage.send(contact, chunk);
     memoryStore.storeAssistantMessage({
       messageId: createLocalMessageId(),
       contact,
-      chatId: null,
+      chatId: message.chatId,
       text: chunk,
       createdAt: new Date().toISOString(),
     });
@@ -108,7 +117,7 @@ async function generateAssistantReply(
   });
 
   const response = await ai.models.generateContentStream({
-    model: appConfig.model,
+    model: appConfig.geminiModel,
     config: {
       systemInstruction: buildSystemPrompt(),
       tools: [{ googleSearch: {} }],
@@ -221,25 +230,12 @@ function splitForIMessage(text: string, maxLength: number): string[] {
 }
 
 function normalizeContact(value: string | null | undefined): string {
-  if (!value) {
-    return "";
-  }
-
+  if (!value) return "";
   const trimmed = value.trim();
-  if (trimmed.includes("@")) {
-    return trimmed.toLowerCase();
-  }
-
+  if (trimmed.includes("@")) return trimmed.toLowerCase();
+  // Strip everything but digits, then re-prefix `+` if it looks like E.164.
   const digits = trimmed.replace(/\D/g, "");
-  if (!digits) {
-    return trimmed.toLowerCase();
-  }
-
-  // Australian local format: 10 digits starting with 0 → +61XXXXXXXXX
-  if (digits.length === 10 && digits.startsWith("0")) {
-    return `+61${digits.slice(1)}`;
-  }
-
+  if (!digits) return trimmed.toLowerCase();
   return `+${digits}`;
 }
 
@@ -248,16 +244,14 @@ function createLocalMessageId(): string {
 }
 
 function toErrorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
+  if (error instanceof Error) return error.message;
   return String(error);
 }
 
 async function start(): Promise<void> {
   const mode = resolveMode();
-  console.log(`[bot] mode: ${mode}`);
-  console.log(`[bot] model: ${appConfig.model}`);
+  console.log(`[atlas] mode: ${mode}`);
+  console.log(`[atlas] model: ${appConfig.geminiModel}`);
 
   if (mode === "cli") {
     await startCliMode();
@@ -268,13 +262,12 @@ async function start(): Promise<void> {
 }
 
 async function shutdown(signal: string): Promise<void> {
-  if (isShuttingDown) {
-    return;
-  }
+  if (isShuttingDown) return;
   isShuttingDown = true;
 
-  console.log(`[bot] shutting down (${signal})`);
+  console.log(`[atlas] shutting down (${signal})`);
   cliInterface?.close();
+  stopSubscription?.();
 
   await Promise.allSettled([queue, Promise.resolve().then(() => closeMemoryStore())]);
   process.exit(0);
@@ -285,43 +278,51 @@ async function startIMessageMode(): Promise<void> {
     throw new Error("ALLOWED_CONTACT is required when running in imessage mode");
   }
 
-  allowedContact = normalizeContact(appConfig.allowedContact);
-  console.log(`[bot] allowed contact: ${allowedContact}`);
+  const allowedContact = normalizeContact(appConfig.allowedContact);
+  console.log(`[atlas] allowed contact: ${allowedContact}`);
+  console.log(`[atlas] imessagekit api: ${appConfig.imessageApiUrl}`);
 
-  // Seed lastRowId so we skip all messages that existed before this session started
-  let lastRowId = getMaxRowId();
-  console.log(`[bot] starting from Messages DB rowid ${lastRowId}`);
-  console.log(`[bot] polling every ${appConfig.pollIntervalMs}ms for messages from ${allowedContact}`);
-
+  // Verify the API is reachable and the bearer token works before subscribing.
   try {
-    await sendViaAppleScript(allowedContact, "im online");
-    console.log("[bot] sent startup message");
+    await imessage.health();
+    console.log("[atlas] imessagekit health ok");
   } catch (error) {
-    console.error("[bot] could not send startup message:", toErrorMessage(error));
+    throw new Error(`imessagekit not reachable at ${appConfig.imessageApiUrl}: ${toErrorMessage(error)}`);
   }
 
-  while (!isShuttingDown) {
-    await sleep(appConfig.pollIntervalMs);
-
+  if (appConfig.startupMessage) {
     try {
-      const fresh = getNewIncomingMessages(allowedContact, lastRowId);
-
-      for (const msg of fresh) {
-        if (msg.rowid > lastRowId) {
-          lastRowId = msg.rowid;
-        }
-
-        if (appConfig.debug) {
-          console.log(`[bot] incoming rowid=${msg.rowid} text="${msg.text.slice(0, 60)}"`);
-        }
-
-        const capturedMsg = msg;
-        enqueue(() => handleMessage(allowedContact, capturedMsg.text, String(capturedMsg.rowid)));
-      }
+      await imessage.send(allowedContact, appConfig.startupMessage);
+      console.log("[atlas] sent startup message");
     } catch (error) {
-      console.error(`[bot] poll error: ${toErrorMessage(error)}`);
+      console.error("[atlas] could not send startup message:", toErrorMessage(error));
     }
   }
+
+  stopSubscription = imessage.subscribe({
+    onConnect: () => console.log("[atlas] event stream connected"),
+    onDisconnect: (reason) => console.warn(`[atlas] event stream disconnected: ${reason}`),
+    onError: (err) => {
+      if (appConfig.debug) console.error("[atlas] stream error:", err.message);
+    },
+    onMessage: (event: SseEvent) => {
+      if (event.type !== "inbound") return;
+      const msg = event.data as IMessage;
+      if (msg.kind !== "text") return;
+
+      if (appConfig.debug) {
+        console.log(
+          `[atlas] inbound rowid=${msg.rowId} text="${(msg.text ?? "").slice(0, 60)}"`
+        );
+      }
+      enqueue(() => handleInbound(msg));
+    },
+  });
+
+  // Park the event loop. Shutdown handlers will resolve.
+  await new Promise<void>(() => {
+    /* runs until shutdown calls process.exit */
+  });
 }
 
 async function startCliMode(): Promise<void> {
@@ -330,34 +331,30 @@ async function startCliMode(): Promise<void> {
 
   cliInterface = createInterface({ input: process.stdin, output: process.stdout });
 
-  console.log(`[bot] cli contact id: ${contact}`);
-  console.log("[bot] commands: /help, /file <path>, /files, /clearfiles, /exit");
+  console.log(`[atlas] cli contact id: ${contact}`);
+  console.log("[atlas] commands: /help, /file <path>, /files, /clearfiles, /exit");
 
   while (true) {
     const input = await questionAsync(cliInterface, "you> ");
     const line = input.trim();
-    if (!line) {
-      continue;
-    }
+    if (!line) continue;
 
-    if (line === "/exit" || line === "/quit") {
-      break;
-    }
+    if (line === "/exit" || line === "/quit") break;
 
     if (line === "/help") {
-      console.log("[bot] /file <path> adds an attachment for the next prompt");
-      console.log("[bot] /files shows queued attachments");
-      console.log("[bot] /clearfiles clears queued attachments");
-      console.log("[bot] /exit quits");
+      console.log("[atlas] /file <path> adds an attachment for the next prompt");
+      console.log("[atlas] /files shows queued attachments");
+      console.log("[atlas] /clearfiles clears queued attachments");
+      console.log("[atlas] /exit quits");
       continue;
     }
 
     if (line === "/files") {
       if (pendingAttachments.length === 0) {
-        console.log("[bot] no queued attachments");
+        console.log("[atlas] no queued attachments");
       } else {
         for (const path of pendingAttachments) {
-          console.log(`[bot] queued: ${path}`);
+          console.log(`[atlas] queued: ${path}`);
         }
       }
       continue;
@@ -365,14 +362,14 @@ async function startCliMode(): Promise<void> {
 
     if (line === "/clearfiles") {
       pendingAttachments.length = 0;
-      console.log("[bot] cleared queued attachments");
+      console.log("[atlas] cleared queued attachments");
       continue;
     }
 
     if (line.startsWith("/file ")) {
       const rawPath = line.slice(6).trim();
       if (!rawPath) {
-        console.log("[bot] usage: /file <path>");
+        console.log("[atlas] usage: /file <path>");
         continue;
       }
 
@@ -380,9 +377,9 @@ async function startCliMode(): Promise<void> {
       try {
         await access(filePath);
         pendingAttachments.push(filePath);
-        console.log(`[bot] queued attachment: ${filePath}`);
+        console.log(`[atlas] queued attachment: ${filePath}`);
       } catch (error) {
-        console.log(`[bot] could not read file: ${toErrorMessage(error)}`);
+        console.log(`[atlas] could not read file: ${toErrorMessage(error)}`);
       }
       continue;
     }
@@ -402,13 +399,13 @@ async function startCliMode(): Promise<void> {
     memoryStore.markMessageRead(userMessageId, nowIso);
     memoryStore.extractAndStoreMemories(contact, line, userMessageId);
 
-    console.log("[bot] thinking...");
+    console.log("[atlas] thinking...");
 
     try {
       const reply = await generateAssistantReply(contact, line, toCliAttachmentInputs(attachmentPaths));
       console.log(`bot> ${reply}\n`);
 
-      for (const chunk of splitForIMessage(reply, 1000)) {
+      for (const chunk of splitForIMessage(reply, appConfig.maxIMessageChunk)) {
         memoryStore.storeAssistantMessage({
           messageId: createLocalMessageId(),
           contact,
@@ -418,7 +415,7 @@ async function startCliMode(): Promise<void> {
         });
       }
     } catch (error) {
-      console.log(`[bot] failed to generate reply: ${toErrorMessage(error)}`);
+      console.log(`[atlas] failed to generate reply: ${toErrorMessage(error)}`);
     }
   }
 
@@ -437,20 +434,14 @@ function resolveMode(): BotMode {
   const rawMode = fromFlag || positionalMode || fromEnv || "imessage";
   const normalized = rawMode.toLowerCase();
 
-  if (normalized === "imessage") {
-    return "imessage";
-  }
-  if (normalized === "cli" || normalized === "terminal") {
-    return "cli";
-  }
+  if (normalized === "imessage") return "imessage";
+  if (normalized === "cli" || normalized === "terminal") return "cli";
 
   throw new Error(`Unsupported BOT mode: ${rawMode}. Use 'imessage' or 'cli'.`);
 }
 
 function closeMemoryStore(): void {
-  if (memoryClosed) {
-    return;
-  }
+  if (memoryClosed) return;
   memoryClosed = true;
   memoryStore.close();
 }
@@ -464,7 +455,7 @@ process.on("SIGTERM", () => {
 });
 
 void start().catch(async (error) => {
-  console.error("[bot] startup failed:", error);
+  console.error("[atlas] startup failed:", error);
   closeMemoryStore();
   process.exit(1);
 });

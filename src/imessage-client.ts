@@ -1,51 +1,78 @@
-import { request as httpRequest } from "node:http";
+// HTTP + SSE client for the imessagekit API.
+// Contract: bearer auth on every request, JSON bodies, SSE event stream for inbound.
+
+import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { execFile } from "node:child_process";
 import { URL } from "node:url";
 
-export interface ApiMessage {
-  guid?: string;
-  id?: number | string;
-  text?: string;
-  message?: string;
-  is_sent?: boolean;
-  sent?: boolean;
-  date?: string | number;
-  handle?: string;
-  sender?: string;
+export interface IMessage {
+  rowId: number;
+  id: string | null;
+  text: string | null;
+  participant: string | null;
+  chatId: string | null;
+  chatKind: "group" | "dm" | "unknown";
+  service: string | null;
+  kind: "text" | "reaction";
+  isFromMe: boolean;
+  isRead: boolean;
+  isSent: boolean;
+  isDelivered: boolean;
+  createdAt: string | null;
+  deliveredAt: string | null;
+  readAt: string | null;
+  hasAttachments: boolean;
 }
 
 export interface IMessageClientConfig {
-  apiKey: string;
   baseUrl: string;
+  apiKey: string;
 }
 
-function httpFetch(
-  url: string,
-  opts: {
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string;
-    timeoutMs?: number;
-  } = {}
-): Promise<{ status: number; body: string }> {
+export type SseEvent =
+  | { type: "hello"; data: { ok: boolean; ts: number } }
+  | { type: "ping"; data: number }
+  | { type: "inbound"; data: IMessage }
+  | { type: "outbound"; data: IMessage }
+  | { type: "debug"; data: unknown };
+
+export interface SseHandlers {
+  onMessage?: (event: SseEvent) => void;
+  onConnect?: () => void;
+  onDisconnect?: (reason: string) => void;
+  onError?: (error: Error) => void;
+}
+
+interface FetchOpts {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  timeoutMs?: number;
+}
+
+interface FetchResult {
+  status: number;
+  body: string;
+}
+
+function fetchJson(url: string, opts: FetchOpts = {}): Promise<FetchResult> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
-    const isHttps = parsed.protocol === "https:";
-    const requestFn = isHttps ? httpsRequest : httpRequest;
+    const requestFn = parsed.protocol === "https:" ? httpsRequest : httpRequest;
 
     const req = requestFn(
       {
         hostname: parsed.hostname,
-        port: parsed.port || (isHttps ? 443 : 80),
+        port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
         path: parsed.pathname + parsed.search,
         method: opts.method ?? "GET",
         headers: opts.headers ?? {},
       },
-      (res) => {
+      (res: IncomingMessage) => {
         let data = "";
-        res.on("data", (chunk: Buffer) => {
-          data += chunk.toString();
+        res.setEncoding("utf8");
+        res.on("data", (chunk: string) => {
+          data += chunk;
         });
         res.on("end", () => resolve({ status: res.statusCode ?? 0, body: data }));
       }
@@ -55,7 +82,7 @@ function httpFetch(
 
     if (opts.timeoutMs) {
       req.setTimeout(opts.timeoutMs, () => {
-        req.destroy(new Error("Request timed out"));
+        req.destroy(new Error(`Request to ${url} timed out after ${opts.timeoutMs}ms`));
       });
     }
 
@@ -67,118 +94,207 @@ function httpFetch(
   });
 }
 
-export async function discoverBaseUrl(candidates: readonly string[]): Promise<string> {
-  for (const url of candidates) {
-    try {
-      const { status } = await httpFetch(`${url}/recent_contacts?num_contacts=1`, {
-        headers: { "api-key": "probe" },
-        timeoutMs: 3000,
-      });
-      // Any HTTP response (including 401 wrong key) means the server is up
-      if (status > 0 && status < 600) {
-        return url;
-      }
-    } catch {
-      // server unreachable — try next
-    }
-  }
-  throw new Error(`No iMessage API reachable. Tried: ${candidates.join(", ")}`);
-}
+export class IMessageClient {
+  constructor(private readonly cfg: IMessageClientConfig) {}
 
-export async function sendIMessage(
-  config: IMessageClientConfig,
-  recipient: string,
-  message: string
-): Promise<void> {
-  const body = JSON.stringify({ recipient, message });
-  const { status, body: resBody } = await httpFetch(`${config.baseUrl}/send?name=false`, {
-    method: "POST",
-    headers: {
-      "api-key": config.apiKey,
-      "Content-Type": "application/json",
-      "Content-Length": String(Buffer.byteLength(body)),
-    },
-    body,
-    timeoutMs: 15000,
-  });
-
-  if (status < 200 || status >= 300) {
-    throw new Error(`Send failed (HTTP ${status}): ${resBody}`);
-  }
-}
-
-export async function fetchMessages(
-  config: IMessageClientConfig,
-  contact: string,
-  numMessages = 20
-): Promise<ApiMessage[]> {
-  const encoded = encodeURIComponent(contact);
-  const { status, body } = await httpFetch(
-    `${config.baseUrl}/messages/${encoded}?name=false&num_messages=${numMessages}&sent=true&formatted=true`,
-    {
-      headers: { "api-key": config.apiKey },
-      timeoutMs: 10000,
-    }
-  );
-
-  if (status === 404) {
-    return [];
+  private authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    return {
+      Authorization: `Bearer ${this.cfg.apiKey}`,
+      ...extra,
+    };
   }
 
-  if (status < 200 || status >= 300) {
-    throw new Error(`Fetch messages failed (HTTP ${status}): ${body}`);
-  }
-
-  try {
-    const parsed: unknown = JSON.parse(body);
-    if (Array.isArray(parsed)) {
-      return parsed as ApiMessage[];
-    }
-    if (parsed && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).messages)) {
-      return (parsed as Record<string, unknown>).messages as ApiMessage[];
-    }
-    return [];
-  } catch {
-    return [];
-  }
-}
-
-export function getMessageId(msg: ApiMessage): string {
-  if (msg.guid) return String(msg.guid);
-  if (msg.id != null) return String(msg.id);
-  return `${msg.text ?? ""}\x00${msg.date ?? ""}`;
-}
-
-export function isIncoming(msg: ApiMessage): boolean {
-  if (msg.is_sent != null) return !msg.is_sent;
-  if (msg.sent != null) return !msg.sent;
-  return true;
-}
-
-export function getMessageText(msg: ApiMessage): string {
-  return msg.text ?? msg.message ?? "";
-}
-
-function escapeAppleScript(str: string): string {
-  return str
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .replace(/\r/g, "")
-    .replace(/\n/g, "\\n");
-}
-
-// Sends via osascript using chat id (works on email-based iMessage accounts on High Sierra)
-export function sendViaAppleScript(phone: string, message: string): Promise<void> {
-  const chatId = `iMessage;-;${escapeAppleScript(phone)}`;
-  const script = `tell application "Messages"\n    send "${escapeAppleScript(message)}" to chat id "${chatId}"\nend tell`;
-
-  return new Promise((resolve, reject) => {
-    execFile("osascript", ["-e", script], (error) => {
-      if (error) {
-        reject(error);
-      } else {
-        resolve();
-      }
+  async health(timeoutMs = 5000): Promise<unknown> {
+    const { status, body } = await fetchJson(`${this.cfg.baseUrl}/health`, {
+      headers: this.authHeaders(),
+      timeoutMs,
     });
-  });
+    if (status < 200 || status >= 300) {
+      throw new Error(`Health check failed (HTTP ${status}): ${body}`);
+    }
+    return JSON.parse(body);
+  }
+
+  async send(to: string, text: string, timeoutMs = 60000): Promise<unknown> {
+    const body = JSON.stringify({ to, text });
+    const { status, body: resBody } = await fetchJson(`${this.cfg.baseUrl}/send`, {
+      method: "POST",
+      headers: this.authHeaders({
+        "Content-Type": "application/json",
+        "Content-Length": String(Buffer.byteLength(body)),
+      }),
+      body,
+      timeoutMs,
+    });
+
+    if (status < 200 || status >= 300) {
+      throw new Error(`Send failed (HTTP ${status}): ${resBody}`);
+    }
+    try {
+      return JSON.parse(resBody);
+    } catch {
+      return null;
+    }
+  }
+
+  async fetchMessages(
+    params: {
+      participant?: string;
+      chatId?: string;
+      isFromMe?: boolean;
+      sinceISO?: string;
+      beforeISO?: string;
+      limit?: number;
+      offset?: number;
+      excludeReactions?: boolean;
+    } = {},
+    timeoutMs = 10000
+  ): Promise<IMessage[]> {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== null) {
+        search.set(key, String(value));
+      }
+    }
+    const qs = search.toString();
+    const url = `${this.cfg.baseUrl}/messages${qs ? `?${qs}` : ""}`;
+
+    const { status, body } = await fetchJson(url, {
+      headers: this.authHeaders(),
+      timeoutMs,
+    });
+
+    if (status < 200 || status >= 300) {
+      throw new Error(`Fetch messages failed (HTTP ${status}): ${body}`);
+    }
+
+    const parsed = JSON.parse(body) as { messages?: IMessage[] };
+    return Array.isArray(parsed.messages) ? parsed.messages : [];
+  }
+
+  // Subscribes to /events. Auto-reconnects with exponential backoff on disconnect.
+  // Returns a stop() function that closes the stream and prevents reconnect.
+  subscribe(handlers: SseHandlers): () => void {
+    let stopped = false;
+    let currentReq: ReturnType<typeof httpRequest> | null = null;
+    let reconnectTimer: NodeJS.Timeout | null = null;
+    let backoffMs = 1000;
+    const maxBackoffMs = 30000;
+
+    const cleanup = () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (currentReq) {
+        try {
+          currentReq.destroy();
+        } catch {
+          // ignore
+        }
+        currentReq = null;
+      }
+    };
+
+    const scheduleReconnect = (reason: string) => {
+      if (stopped) return;
+      handlers.onDisconnect?.(reason);
+      const delay = backoffMs;
+      backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
+      reconnectTimer = setTimeout(connect, delay);
+    };
+
+    const connect = () => {
+      if (stopped) return;
+
+      const parsed = new URL(`${this.cfg.baseUrl}/events`);
+      const requestFn = parsed.protocol === "https:" ? httpsRequest : httpRequest;
+
+      const req = requestFn(
+        {
+          hostname: parsed.hostname,
+          port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+          path: parsed.pathname + parsed.search,
+          method: "GET",
+          headers: this.authHeaders({
+            Accept: "text/event-stream",
+            "Cache-Control": "no-cache",
+          }),
+        },
+        (res: IncomingMessage) => {
+          if ((res.statusCode ?? 0) !== 200) {
+            res.resume();
+            scheduleReconnect(`HTTP ${res.statusCode ?? 0}`);
+            return;
+          }
+
+          backoffMs = 1000;
+          handlers.onConnect?.();
+
+          let buffer = "";
+          let currentEvent = "message";
+          let currentData: string[] = [];
+
+          res.setEncoding("utf8");
+          res.on("data", (chunk: string) => {
+            buffer += chunk;
+            // SSE: events delimited by blank line. Lines split by \n.
+            let nlIdx: number;
+            while ((nlIdx = buffer.indexOf("\n")) !== -1) {
+              const line = buffer.slice(0, nlIdx).replace(/\r$/, "");
+              buffer = buffer.slice(nlIdx + 1);
+
+              if (line === "") {
+                if (currentData.length > 0) {
+                  const payload = currentData.join("\n");
+                  let data: unknown = payload;
+                  try {
+                    data = JSON.parse(payload);
+                  } catch {
+                    // leave as raw string
+                  }
+                  handlers.onMessage?.({
+                    type: currentEvent,
+                    data,
+                  } as SseEvent);
+                }
+                currentEvent = "message";
+                currentData = [];
+                continue;
+              }
+
+              if (line.startsWith(":")) continue; // SSE comment
+              if (line.startsWith("event:")) {
+                currentEvent = line.slice(6).trim();
+              } else if (line.startsWith("data:")) {
+                currentData.push(line.slice(5).replace(/^ /, ""));
+              }
+            }
+          });
+
+          res.on("end", () => scheduleReconnect("stream ended"));
+          res.on("close", () => scheduleReconnect("stream closed"));
+          res.on("error", (err: Error) => {
+            handlers.onError?.(err);
+            scheduleReconnect(`stream error: ${err.message}`);
+          });
+        }
+      );
+
+      req.on("error", (err: Error) => {
+        handlers.onError?.(err);
+        scheduleReconnect(`connect error: ${err.message}`);
+      });
+
+      req.end();
+      currentReq = req;
+    };
+
+    connect();
+
+    return () => {
+      stopped = true;
+      cleanup();
+    };
+  }
 }
