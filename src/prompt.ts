@@ -63,24 +63,3 @@ export function buildUserContext(context: PromptContext): string {
   ].join("\n");
 }
 
-export function chooseReaction(text: string | null, attachmentCount: number): string {
-  if (attachmentCount > 0) {
-    return "👀";
-  }
-
-  const lower = (text || "").toLowerCase();
-  if (lower.includes("?")) {
-    return "🤔";
-  }
-  if (/(lol|lmao|haha|hehe)/.test(lower)) {
-    return "😂";
-  }
-  if (/(thank you|thanks|ty)/.test(lower)) {
-    return "🙏";
-  }
-  if (/(hard|rough|sad|anxious|stressed)/.test(lower)) {
-    return "🫶";
-  }
-
-  return "👍";
-}

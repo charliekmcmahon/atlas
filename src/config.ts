@@ -49,7 +49,6 @@ export const appConfig = {
   dbPath: resolve(process.env.MEMORY_DB_PATH?.trim() || "./data/memories.sqlite"),
 
   // Behavior
-  sendEmojiReaction: toBool(process.env.SEND_EMOJI_REACTION, true),
   maxAttachmentBytes: toPositiveInt(process.env.MAX_ATTACHMENT_BYTES, 20 * 1024 * 1024),
   maxIMessageChunk: toPositiveInt(process.env.MAX_IMESSAGE_CHUNK, 1000),
   startupMessage: process.env.STARTUP_MESSAGE?.trim() || "",

@@ -32,6 +32,7 @@ imessagekit, the Gemini logic lives here.
 - extracts simple durable facts (name, location, timezone, preferences) from
   user messages and persists them per contact
 - has a `cli` mode for prompt iteration without sending anything over iMessage
+- supports a small set of `/` commands over iMessage (see below)
 
 ## Requirements
 
@@ -97,7 +98,6 @@ See `.env.example` for the full list. Notable knobs:
 | ---------------------- | ------------------------ | ------------------------------------------------ |
 | `GEMINI_MODEL`         | `gemini-2.5-flash`       | Any model your key has access to                 |
 | `STARTUP_MESSAGE`      | _(unset)_                | If set, sent on boot so you know it's alive      |
-| `SEND_EMOJI_REACTION`  | `true`                   | Pre-reply ack emoji                              |
 | `MAX_IMESSAGE_CHUNK`   | `1000`                   | Soft cap per outbound message                    |
 | `MAX_ATTACHMENT_BYTES` | `20971520` (20 MiB)      | Skip Gemini file uploads larger than this        |
 | `MEMORY_DB_PATH`       | `./data/memories.sqlite` | Local SQLite store                               |

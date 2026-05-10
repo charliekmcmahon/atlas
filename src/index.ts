@@ -14,7 +14,7 @@ import {
 
 import { appConfig } from "./config.js";
 import { MemoryStore } from "./db.js";
-import { buildSystemPrompt, buildUserContext, chooseReaction } from "./prompt.js";
+import { buildSystemPrompt, buildUserContext } from "./prompt.js";
 import { IMessageClient, type IMessage, type SseEvent } from "./imessage-client.js";
 
 type BotMode = "imessage" | "cli";
@@ -81,14 +81,6 @@ async function handleInbound(message: IMessage): Promise<void> {
 
   memoryStore.extractAndStoreMemories(contact, text, messageId);
   memoryStore.markMessageRead(messageId, new Date().toISOString());
-
-  if (appConfig.sendEmojiReaction) {
-    try {
-      await imessage.send(contact, chooseReaction(text, 0));
-    } catch (error) {
-      console.error("[atlas] failed to send reaction:", toErrorMessage(error));
-    }
-  }
 
   const reply = await generateAssistantReply(contact, text, []);
 
