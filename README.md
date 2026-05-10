@@ -5,30 +5,30 @@ allowlisted contact, generates a reply with Gemini, and sends it back over
 iMessage. Includes per-contact long-term memory in SQLite.
 
 Atlas does **not** talk to `chat.db` or `osascript` directly. It is a thin
-client of `imessagekit` — a separate local-network REST + SSE server that
+client of `imessage-api-catalina` — a separate local-network REST + SSE server that
 owns the Messages.app integration. This separation means atlas itself is a
 portable, public-friendly Node service: the macOS-specific plumbing lives in
-imessagekit, the Gemini logic lives here.
+imessage-api-catalina, the Gemini logic lives here.
 
 ```
-┌────────────┐   SSE /events   ┌───────────────┐   AppleScript   ┌────────────┐
-│   atlas    │ ◄────────────── │  imessagekit  │ ──────────────► │ Messages.app│
-│  (this)    │ ──────────────► │  (port 8787)  │ ◄────────────── │  chat.db   │
-│            │   POST /send    │               │   read-only DB  │            │
-└────────────┘                 └───────────────┘                 └────────────┘
-       │                                                                       
-       └──► Gemini API (text + multimodal)                                     
-       └──► local SQLite (memories, conversation log)                          
+┌────────────┐   SSE /events    ┌─────────────────────────┐   AppleScript   ┌──────────────┐
+│   atlas    │ ◄─────────────── │  imessage-api-catalina  │ ──────────────► │ Messages.app │
+│   (this)   │ ───────────────► │       (port 8787)       │ ◄────────────── │   chat.db    │
+│            │   POST /send     │                         │   read-only DB  │              │
+└────────────┘                  └─────────────────────────┘                 └──────────────┘
+       │
+       └──► Gemini API (text + multimodal)
+       └──► local SQLite (memories, conversation log)
 ```
 
 ## What it does
 
-- subscribes to imessagekit's `/events` SSE stream and reacts to inbound
+- subscribes to imessage-api-catalina's `/events` SSE stream and reacts to inbound
   messages from the allowlisted contact
 - queries Gemini (`gemini-2.5-flash` by default) with system prompt + recent
   conversation + extracted memories + any attachments
 - splits long replies on whitespace and sends each chunk through
-  imessagekit's `POST /send`
+  imessage-api-catalina's `POST /send`
 - extracts simple durable facts (name, location, timezone, preferences) from
   user messages and persists them per contact
 - has a `cli` mode for prompt iteration without sending anything over iMessage
@@ -37,7 +37,7 @@ imessagekit, the Gemini logic lives here.
 ## Requirements
 
 - Node.js 18+
-- A running `imessagekit` instance (typically on the same Mac that owns the
+- A running `imessage-api-catalina` instance (typically on the same Mac that owns the
   Apple ID — atlas itself can run anywhere that can reach it)
 - A Gemini API key
 

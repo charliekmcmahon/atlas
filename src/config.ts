@@ -35,10 +35,10 @@ export const appConfig = {
   geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash",
 
   // The phone or Apple ID this bot will reply to. Must also be in the
-  // imessagekit server's ALLOWED_RECIPIENTS list, or sends will be rejected.
+  // imessage-api-catalina server's ALLOWED_RECIPIENTS list, or sends will be rejected.
   allowedContact: process.env.ALLOWED_CONTACT?.trim() || "",
 
-  // imessagekit API
+  // imessage-api-catalina API
   imessageApiUrl: normalizeBaseUrl(process.env.IMESSAGE_API_URL?.trim() || "http://localhost:8787"),
   imessageApiKey: getRequiredEnv("IMESSAGE_API_KEY"),
 

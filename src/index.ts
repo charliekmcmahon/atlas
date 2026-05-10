@@ -305,14 +305,14 @@ async function startIMessageMode(): Promise<void> {
 
   const allowedContact = normalizeContact(appConfig.allowedContact);
   console.log(`[atlas] allowed contact: ${allowedContact}`);
-  console.log(`[atlas] imessagekit api: ${appConfig.imessageApiUrl}`);
+  console.log(`[atlas] imessage api: ${appConfig.imessageApiUrl}`);
 
   // Verify the API is reachable and the bearer token works before subscribing.
   try {
     await imessage.health();
-    console.log("[atlas] imessagekit health ok");
+    console.log("[atlas] imessage api health ok");
   } catch (error) {
-    throw new Error(`imessagekit not reachable at ${appConfig.imessageApiUrl}: ${toErrorMessage(error)}`);
+    throw new Error(`imessage api not reachable at ${appConfig.imessageApiUrl}: ${toErrorMessage(error)}`);
   }
 
   // Pick the boot greeting:

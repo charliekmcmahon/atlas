@@ -1,4 +1,4 @@
-// HTTP + SSE client for the imessagekit API.
+// HTTP + SSE client for the imessage-api-catalina server.
 // Contract: bearer auth on every request, JSON bodies, SSE event stream for inbound.
 
 import { request as httpRequest, type IncomingMessage } from "node:http";

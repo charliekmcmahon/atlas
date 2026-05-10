@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # atlas — startup script.
 # Validates env, builds TypeScript, runs in iMessage mode.
-# Assumes imessagekit is already running and reachable at $IMESSAGE_API_URL.
+# Assumes imessage-api-catalina is already running and reachable at $IMESSAGE_API_URL.
 
 set -euo pipefail
 
@@ -36,7 +36,7 @@ GEMINI_KEY=$(read_env GEMINI_API_KEY)
 
 IMESSAGE_KEY=$(read_env IMESSAGE_API_KEY)
 [ -n "$IMESSAGE_KEY" ] && [ "$IMESSAGE_KEY" != "replace-me-with-server-api-key" ] \
-  || die "IMESSAGE_API_KEY not set in .env (must match the imessagekit server's API_KEY)"
+  || die "IMESSAGE_API_KEY not set in .env (must match the imessage-api-catalina server's API_KEY)"
 
 IMESSAGE_URL=$(read_env IMESSAGE_API_URL)
 IMESSAGE_URL="${IMESSAGE_URL:-http://localhost:8787}"
@@ -58,11 +58,11 @@ fi
 
 mkdir -p "$SCRIPT_DIR/data"
 
-# Sanity check imessagekit reachability
-log "Checking imessagekit at $IMESSAGE_URL ..."
+# Sanity check imessage-api-catalina reachability
+log "Checking imessage-api-catalina at $IMESSAGE_URL ..."
 if ! curl -sf --max-time 3 -H "Authorization: Bearer $IMESSAGE_KEY" "${IMESSAGE_URL}/health" >/dev/null; then
-  warn "imessagekit not reachable at $IMESSAGE_URL — atlas will fail health check on startup."
-  warn "Start imessagekit first, or fix IMESSAGE_API_URL / IMESSAGE_API_KEY in .env."
+  warn "imessage-api-catalina not reachable at $IMESSAGE_URL — atlas will fail health check on startup."
+  warn "Start imessage-api-catalina first, or fix IMESSAGE_API_URL / IMESSAGE_API_KEY in .env."
 fi
 
 # Build TypeScript
