@@ -62,6 +62,9 @@ async function handleInbound(message: IMessage): Promise<void> {
   const text = message.text ?? "";
   if (!text.trim()) return;
 
+  // Built-in chat commands take precedence over Gemini.
+  if (await maybeHandleCommand(contact, text)) return;
+
   const messageId = message.id ?? `row-${message.rowId}`;
   const nowIso = message.createdAt ?? new Date().toISOString();
 
@@ -99,6 +102,36 @@ async function handleInbound(message: IMessage): Promise<void> {
       createdAt: new Date().toISOString(),
     });
   }
+}
+
+// Inbound text starting with "/" is treated as a control command, not a prompt.
+// Returns true if the text was handled (no Gemini reply should follow).
+async function maybeHandleCommand(contact: string, rawText: string): Promise<boolean> {
+  const cmd = rawText.trim().toLowerCase();
+  if (!cmd.startsWith("/")) return false;
+
+  if (cmd === "/reboot") {
+    console.log("[atlas] /reboot received — pulling latest code and restarting");
+    try {
+      await imessage.send(contact, "rebooting...");
+    } catch (error) {
+      console.error("[atlas] could not send reboot ack:", toErrorMessage(error));
+    }
+    void shutdown("reboot", 42);
+    return true;
+  }
+
+  if (cmd === "/ping") {
+    try {
+      await imessage.send(contact, "pong");
+    } catch (error) {
+      console.error("[atlas] could not send pong:", toErrorMessage(error));
+    }
+    return true;
+  }
+
+  // Unknown slash command — let it fall through to Gemini so the user gets feedback.
+  return false;
 }
 
 async function generateAssistantReply(
@@ -261,16 +294,16 @@ async function start(): Promise<void> {
   await startIMessageMode();
 }
 
-async function shutdown(signal: string): Promise<void> {
+async function shutdown(signal: string, exitCode = 0): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
-  console.log(`[atlas] shutting down (${signal})`);
+  console.log(`[atlas] shutting down (${signal}, exit=${exitCode})`);
   cliInterface?.close();
   stopSubscription?.();
 
   await Promise.allSettled([queue, Promise.resolve().then(() => closeMemoryStore())]);
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 async function startIMessageMode(): Promise<void> {

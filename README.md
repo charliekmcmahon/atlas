@@ -75,6 +75,20 @@ npm run cli
 
 CLI commands: `/help`, `/file <path>`, `/files`, `/clearfiles`, `/exit`.
 
+## Chat commands (iMessage mode)
+
+When started via `start.sh`, the wrapper acts as a supervisor. Send these
+over iMessage from the allowlisted contact:
+
+| command   | effect                                                              |
+| --------- | ------------------------------------------------------------------- |
+| `/ping`   | Replies `pong`. Liveness check.                                     |
+| `/reboot` | Acks, exits with code 42. `start.sh` then `git pull`s, reinstalls,  |
+|           | rebuilds, and relaunches. Use this to ship prompt/code updates.     |
+
+Unknown slash commands fall through to Gemini, so feel free to text `/foo`
+and ask it what you meant.
+
 ## Configuration reference
 
 See `.env.example` for the full list. Notable knobs:

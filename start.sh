@@ -71,8 +71,40 @@ log "Building..."
   || die "tsc build failed. Inspect the error above."
 
 log "Starting atlas (iMessage mode). Log: $LOG_FILE"
-log "Press Ctrl+C to stop."
+log "Press Ctrl+C to stop. Send '/reboot' over iMessage to pull + restart."
 echo ""
 
 cd "$SCRIPT_DIR"
-exec node dist/index.js --mode=imessage 2>&1 | tee -a "$LOG_FILE"
+
+# Supervisor loop. Exit code 42 means "/reboot was requested" — pull latest
+# code, reinstall, rebuild, and relaunch. Any other exit code stops the loop.
+REBOOT_EXIT_CODE=42
+while true; do
+  set +e
+  node dist/index.js --mode=imessage 2>&1 | tee -a "$LOG_FILE"
+  EXIT_CODE=${PIPESTATUS[0]}
+  set -e
+
+  if [ "$EXIT_CODE" -ne "$REBOOT_EXIT_CODE" ]; then
+    log "atlas exited with code $EXIT_CODE — stopping."
+    exit "$EXIT_CODE"
+  fi
+
+  log "Reboot requested. Pulling latest code..."
+  if git -C "$SCRIPT_DIR" fetch --quiet origin; then
+    git -C "$SCRIPT_DIR" reset --hard origin/main || warn "git reset failed — continuing with local copy"
+  else
+    warn "git fetch failed — restarting with current code"
+  fi
+
+  log "Reinstalling dependencies..."
+  npm install --omit=dev --prefix "$SCRIPT_DIR" || warn "npm install failed — continuing with existing node_modules"
+
+  log "Rebuilding..."
+  if ! "$SCRIPT_DIR/node_modules/.bin/tsc" -p "$SCRIPT_DIR/tsconfig.json"; then
+    warn "tsc build failed — relaunching with the previous dist/"
+  fi
+
+  log "Restarting atlas..."
+  echo ""
+done
