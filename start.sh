@@ -78,10 +78,13 @@ cd "$SCRIPT_DIR"
 
 # Supervisor loop. Exit code 42 means "/reboot was requested" — pull latest
 # code, reinstall, rebuild, and relaunch. Any other exit code stops the loop.
+# ATLAS_REBOOTING is empty on the first run, "1" after a reboot — atlas reads
+# this and sends a "back online!" ping to the allowlisted contact.
 REBOOT_EXIT_CODE=42
+ATLAS_REBOOTING=
 while true; do
   set +e
-  node dist/index.js --mode=imessage 2>&1 | tee -a "$LOG_FILE"
+  ATLAS_REBOOTING="$ATLAS_REBOOTING" node dist/index.js --mode=imessage 2>&1 | tee -a "$LOG_FILE"
   EXIT_CODE=${PIPESTATUS[0]}
   set -e
 
@@ -105,6 +108,7 @@ while true; do
     warn "tsc build failed — relaunching with the previous dist/"
   fi
 
+  ATLAS_REBOOTING=1
   log "Restarting atlas..."
   echo ""
 done

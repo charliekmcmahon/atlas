@@ -315,12 +315,20 @@ async function startIMessageMode(): Promise<void> {
     throw new Error(`imessagekit not reachable at ${appConfig.imessageApiUrl}: ${toErrorMessage(error)}`);
   }
 
-  if (appConfig.startupMessage) {
+  // Pick the boot greeting:
+  //   - post-reboot (supervisor set ATLAS_REBOOTING=1) → "back online!"
+  //   - cold start with STARTUP_MESSAGE configured → that message
+  //   - otherwise → silent
+  const bootMessage = process.env.ATLAS_REBOOTING === "1"
+    ? "back online!"
+    : appConfig.startupMessage || "";
+
+  if (bootMessage) {
     try {
-      await imessage.send(allowedContact, appConfig.startupMessage);
-      console.log("[atlas] sent startup message");
+      await imessage.send(allowedContact, bootMessage);
+      console.log(`[atlas] sent boot message: ${bootMessage}`);
     } catch (error) {
-      console.error("[atlas] could not send startup message:", toErrorMessage(error));
+      console.error("[atlas] could not send boot message:", toErrorMessage(error));
     }
   }
 
