@@ -1,4 +1,4 @@
-import { Type, type FunctionDeclaration, GoogleGenAI } from "@google/genai";
+import { Type, type FunctionDeclaration, GoogleGenAI, ThinkingLevel } from "@google/genai";
 import type { MemoryStore, Reminder, UserProfile, AgentTask } from "./db.js";
 import { appConfig } from "./config.js";
 import { computeNextFromCron } from "./agent-tasks.js";
@@ -128,6 +128,19 @@ export const toolDeclarations: FunctionDeclaration[] = [
       required: ["query"],
     },
   },
+  {
+    name: "google_maps",
+    description:
+      "Search Google Maps and return structured top results and a short summary. Use this for places, businesses, addresses, and location-specific queries.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        query: { type: Type.STRING, description: "Maps search query" },
+        limit: { type: Type.INTEGER, description: "Max number of results to return" },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
 export async function runToolCall(
@@ -152,6 +165,8 @@ export async function runToolCall(
       return handleCancelAgentTask(args, ctx);
     case "google_search":
       return handleGoogleSearch(args, ctx);
+    case "google_maps":
+      return handleGoogleMaps(args, ctx);
     default:
       return {
         payload: { error: `unknown tool: ${name}` },
@@ -219,90 +234,233 @@ async function handleGoogleSearch(args: Record<string, unknown>, ctx: ToolContex
   if (!query) return { payload: { ok: false, error: "query is required" } };
 
   try {
-      // Perform a basic Google search by fetching and parsing the search results page.
-      // This is a simple fallback since the GenAI SDK doesn't expose a search API.
-      const encoded = encodeURIComponent(query);
-      const searchUrl = `https://www.google.com/search?q=${encoded}&num=${limit}`;
+    const parsed = await runGoogleSearchSubagent(query, limit);
 
-      const response = await fetch(searchUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error(`Google search HTTP ${response.status}`);
-      }
-
-      const html = await response.text();
-
-      // Simple regex-based parsing of Google search results
-      // Pattern: looks for result blocks with title, snippet, and URL
-      const resultPattern =
-        /<div[^>]*data-sokoban-container[^>]*>.*?<h3[^>]*><a[^>]*href="\/url\?q=([^&]+)[^"]*"[^>]*>([^<]+)<\/a><\/h3>.*?<div[^>]*style="[^"]*"[^>]*>([^<]*)<\/div>/gs;
-
-      const top: Array<{ title: string; snippet: string; url: string }> = [];
-      let match;
-      while ((match = resultPattern.exec(html)) && top.length < limit) {
-        try {
-          const url = decodeURIComponent(match[1]);
-          const title = match[2]?.replace(/<[^>]*>/g, "") || "";
-          const snippet = match[3]?.replace(/<[^>]*>/g, "").slice(0, 200) || "";
-
-          // Skip ads, "About" results, and other non-web results
-          if (
-            url &&
-            title &&
-            !url.includes("google.") &&
-            !title.toLowerCase().includes("related searches") &&
-            !title.toLowerCase().includes("searches related to")
-          ) {
-            top.push({ title: title.trim(), snippet: snippet.trim(), url });
-          }
-        } catch {
-          // Skip malformed results
-        }
-      }
-
-      if (top.length === 0) {
-        return {
-          payload: {
-            ok: true,
-            query,
-            results: [],
-            summary:
-              "No search results found. The model's knowledge may be limited or the query too specific. Try a simpler or more general query.",
-          },
-          log: `google_search: ${query} -> 0 results (parsing may have failed)`,
-        };
-      }
-
-    // Ask Gemini to synthesize a short summary for the user
-    const contents = [
-      { role: "system", text: `You are a concise web search summarizer.` },
-      {
-        role: "user",
-        text: `Summarize the following search results for the query: ${query}\n\nResults:\n${top
-          .map((t) => `- ${t.title}: ${t.snippet} (${t.url})`)
-          .join("\n")}`,
+    return {
+      payload: {
+        ok: true,
+        query,
+        results: parsed.results,
+        summary: parsed.summary,
       },
-    ];
-
-    const genResponse = await ai.models.generateContent({
-      model: appConfig.geminiModel,
-      config: { systemInstruction: "Summarize search results briefly and provide a short actionable answer." },
-      contents,
-    });
-
-    const summary = genResponse.candidates?.[0]?.content?.parts?.map((p: any) => p.text ?? "").join("") ?? "";
-
-    return { payload: { ok: true, query, results: top, summary }, log: `google_search: ${query} -> ${top.length} results` };
+      log: `google_search: ${query} -> ${parsed.results.length} results`,
+    };
   } catch (error) {
     return {
       payload: { ok: false, error: toErrorMessage(error) },
       log: `google_search error: ${toErrorMessage(error)}`,
     };
   }
+}
+
+async function handleGoogleMaps(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+  const query = typeof args.query === "string" ? args.query.trim() : "";
+  const limit = typeof args.limit === "number" && args.limit > 0 ? Math.min(10, Math.floor(args.limit)) : 5;
+  if (!query) return { payload: { ok: false, error: "query is required" } };
+
+  try {
+    const parsed = await runGoogleMapsSubagent(query, limit);
+
+    return {
+      payload: {
+        ok: true,
+        query,
+        results: parsed.results,
+        summary: parsed.summary,
+      },
+      log: `google_maps: ${query} -> ${parsed.results.length} results`,
+    };
+  } catch (error) {
+    return {
+      payload: { ok: false, error: toErrorMessage(error) },
+      log: `google_maps error: ${toErrorMessage(error)}`,
+    };
+  }
+}
+
+interface GoogleSearchResultItem {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+interface GoogleMapsResultItem {
+  name: string;
+  address: string;
+  url: string;
+}
+
+async function runGoogleSearchSubagent(
+  query: string,
+  limit: number
+): Promise<{ summary: string; results: GoogleSearchResultItem[] }> {
+  const responseSchema = {
+    type: "object",
+    properties: {
+      summary: { type: "string" },
+      results: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            title: { type: "string" },
+            url: { type: "string" },
+            snippet: { type: "string" },
+          },
+          required: ["title", "url", "snippet"],
+        },
+      },
+    },
+    required: ["summary", "results"],
+  };
+
+  const response = await ai.models.generateContent({
+    model: appConfig.geminiModel,
+    config: {
+      systemInstruction:
+        "Use the google_search tool to find current results. Respond only with JSON containing summary and results (title, url, snippet).",
+      tools: [{ googleSearch: {} }],
+      responseMimeType: "application/json",
+      responseSchema,
+      thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+    },
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: `Search the web for: ${query}. Return up to ${limit} results.` }],
+      },
+    ],
+  });
+
+  const rawText =
+    response.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text ?? "")
+      .join("")
+      .trim() ?? "";
+  const parsed = parseSearchResponse(rawText, limit);
+  if (!parsed) {
+    throw new Error("google search returned an unreadable response");
+  }
+
+  return parsed;
+}
+
+async function runGoogleMapsSubagent(
+  query: string,
+  limit: number
+): Promise<{ summary: string; results: GoogleMapsResultItem[] }> {
+  const response = await ai.models.generateContent({
+    model: "gemini-3.1-flash-lite",
+    config: {
+      systemInstruction:
+        "Use the google_maps tool to find current places and answer concisely.",
+      tools: [{ googleMaps: {} }],
+      thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+    },
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: `Search Google Maps for: ${query}. Return up to ${limit} results.` }],
+      },
+    ],
+  });
+
+  const rawText =
+    response.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text ?? "")
+      .join("")
+      .trim() ?? "";
+  const results = extractMapsResultsFromGrounding(response.candidates?.[0]?.groundingMetadata, limit);
+  const summary = rawText || summarizeMapsResults(results);
+  if (!summary && results.length === 0) {
+    throw new Error("google maps returned an empty response");
+  }
+
+  return { summary, results };
+}
+
+function parseSearchResponse(rawText: string, limit: number): { summary: string; results: GoogleSearchResultItem[] } | null {
+  const jsonText = extractJsonPayload(rawText);
+  if (!jsonText) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+
+  if (!parsed || typeof parsed !== "object") return null;
+  const record = parsed as { summary?: unknown; results?: unknown };
+  const summary = typeof record.summary === "string" ? record.summary.trim() : "";
+  const results = normalizeSearchResults(record.results, limit);
+  if (!summary && results.length === 0) return null;
+
+  return { summary, results };
+}
+
+function extractJsonPayload(rawText: string): string | null {
+  const trimmed = rawText.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) return trimmed;
+
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) return fenced[1].trim();
+
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  return trimmed.slice(start, end + 1);
+}
+
+function normalizeSearchResults(raw: unknown, limit: number): GoogleSearchResultItem[] {
+  if (!Array.isArray(raw)) return [];
+
+  const results: GoogleSearchResultItem[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as { title?: unknown; url?: unknown; snippet?: unknown };
+    const title = typeof record.title === "string" ? record.title.trim() : "";
+    const url = typeof record.url === "string" ? record.url.trim() : "";
+    const snippet = typeof record.snippet === "string" ? record.snippet.trim() : "";
+    if (!title || !url) continue;
+    results.push({ title, url, snippet });
+    if (results.length >= limit) break;
+  }
+
+  return results;
+}
+
+function extractMapsResultsFromGrounding(grounding: unknown, limit: number): GoogleMapsResultItem[] {
+  if (!grounding || typeof grounding !== "object") return [];
+  const record = grounding as { groundingChunks?: unknown };
+  if (!Array.isArray(record.groundingChunks)) return [];
+
+  const results: GoogleMapsResultItem[] = [];
+  for (const chunk of record.groundingChunks) {
+    if (!chunk || typeof chunk !== "object") continue;
+    const maps = (chunk as { maps?: unknown }).maps;
+    if (!maps || typeof maps !== "object") continue;
+    const mapsRecord = maps as { title?: unknown; uri?: unknown; text?: unknown };
+    const name = typeof mapsRecord.title === "string" ? mapsRecord.title.trim() : "";
+    const url = typeof mapsRecord.uri === "string" ? mapsRecord.uri.trim() : "";
+    const address = typeof mapsRecord.text === "string" ? mapsRecord.text.trim() : "";
+    if (!name) continue;
+    results.push({ name, address, url });
+    if (results.length >= limit) break;
+  }
+
+  return results;
+}
+
+function summarizeMapsResults(results: GoogleMapsResultItem[]): string {
+  if (results.length === 0) return "";
+  const names = results
+    .map((result) => result.name)
+    .filter((name) => name.length > 0)
+    .slice(0, 3);
+  if (names.length === 0) return "";
+  return `top picks: ${names.join(", ")}`;
 }
 
 function handleSetUserInfo(args: Record<string, unknown>, ctx: ToolContext): ToolResult {

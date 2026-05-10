@@ -33,6 +33,7 @@ export function buildSystemPrompt(): string {
     "- set_reminder(text, due_at): schedule a reminder. atlas will text the reminder back at due_at. due_at must be ISO 8601 with a timezone offset (e.g. '2026-05-11T15:00:00-04:00'). compute it from the user's timezone.",
     "- list_reminders(): list pending reminders.",
     "- cancel_reminder(id): cancel one by id.",
+    "- google_maps(query, limit?): search google maps for places, businesses, or addresses and return structured results.",
     "",
     "profile slot rules:",
     "- the user's profile has four slots: name, location, timezone, language. some may be unfilled.",
