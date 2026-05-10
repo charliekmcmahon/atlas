@@ -1,5 +1,5 @@
 import type { MemoryStore, AgentTask } from "./db.js";
-import * as cronParser from "cron-parser";
+import { CronExpressionParser } from "cron-parser";
 
 export type AgentTaskDeliverer = (task: AgentTask) => Promise<void>;
 
@@ -53,8 +53,8 @@ export class AgentTaskScheduler {
           let nextRun: string | null = null;
           if (task.schedule) {
             try {
-              const iter = (cronParser as any).parse(task.schedule, { currentDate: new Date() });
-              nextRun = iter.next().toISOString();
+              const expr = CronExpressionParser.parse(task.schedule, { currentDate: new Date() });
+              nextRun = expr.next().toDate().toISOString();
             } catch (e) {
               console.error("[atlas] invalid cron for task", task.id, task.schedule, e);
               nextRun = null;
@@ -73,6 +73,6 @@ export class AgentTaskScheduler {
 }
 
 export function computeNextFromCron(schedule: string, from?: Date): string {
-  const iter = (cronParser as any).parse(schedule, { currentDate: from ?? new Date() });
-  return iter.next().toISOString();
+  const expr = CronExpressionParser.parse(schedule, { currentDate: from ?? new Date() });
+  return expr.next().toDate().toISOString();
 }

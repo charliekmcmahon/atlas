@@ -20,6 +20,7 @@ import { ReminderScheduler } from "./scheduler.js";
 import { runToolCall, toolDeclarations } from "./tools.js";
 import { AgentTaskScheduler } from "./agent-tasks.js";
 import { IMessageClient, type IMessage, type SseEvent } from "./imessage-client.js";
+import { writeFileSync, existsSync, rmSync } from "node:fs";
 
 type BotMode = "imessage" | "cli";
 
@@ -113,6 +114,13 @@ async function maybeHandleCommand(contact: string, rawText: string): Promise<boo
   if (cmd === "/reboot") {
     console.log("[atlas] /reboot received — pulling latest code and restarting");
     try {
+      // Mark this as a reboot so the next startup sends "back online!"
+      const rebootMarkerPath = `${appConfig.dbPath}.reboot-marker`;
+      try {
+        writeFileSync(rebootMarkerPath, String(Date.now()), "utf-8");
+      } catch (err) {
+        console.warn("[atlas] could not write reboot marker:", toErrorMessage(err));
+      }
       await imessage.send(contact, "rebooting...");
     } catch (error) {
       console.error("[atlas] could not send reboot ack:", toErrorMessage(error));
@@ -478,6 +486,9 @@ async function startIMessageMode(): Promise<void> {
     store: memoryStore,
     deliver: deliverReminderToIMessage,
     intervalMs: appConfig.reminderTickMs,
+    onError: (error, reminder) => {
+      console.error(`[atlas] reminder ${reminder.id} delivery failed:`, toErrorMessage(error));
+    },
   });
   scheduler.start();
   console.log(`[atlas] reminder scheduler started (tick: ${appConfig.reminderTickMs}ms)`);
@@ -486,17 +497,34 @@ async function startIMessageMode(): Promise<void> {
     store: memoryStore,
     deliver: deliverAgentTaskToIMessage,
     intervalMs: appConfig.agentTaskTickMs ?? appConfig.reminderTickMs,
+    onError: (error, task) => {
+      console.error(`[atlas] agent task ${task.id} delivery failed:`, toErrorMessage(error));
+    },
   });
   agentScheduler.start();
   console.log(`[atlas] agent task scheduler started (tick: ${appConfig.agentTaskTickMs ?? appConfig.reminderTickMs}ms)`);
 
   // Pick the boot greeting:
-  //   - post-reboot (supervisor set ATLAS_REBOOTING=1) → "back online!"
+  //   - post-reboot (reboot marker file exists) → "back online!"
   //   - cold start with STARTUP_MESSAGE configured → that message
   //   - otherwise → silent
-  const bootMessage = process.env.ATLAS_REBOOTING === "1"
-    ? "back online!"
-    : appConfig.startupMessage || "";
+  const rebootMarkerPath = `${appConfig.dbPath}.reboot-marker`;
+  let bootMessage = "";
+  try {
+    if (existsSync(rebootMarkerPath)) {
+      bootMessage = "back online!";
+      try {
+        rmSync(rebootMarkerPath);
+      } catch (err) {
+        console.warn("[atlas] could not clean up reboot marker:", toErrorMessage(err));
+      }
+    } else {
+      bootMessage = appConfig.startupMessage || "";
+    }
+  } catch (error) {
+    console.warn("[atlas] could not check reboot marker:", toErrorMessage(error));
+    bootMessage = appConfig.startupMessage || "";
+  }
 
   if (bootMessage) {
     try {
@@ -509,9 +537,11 @@ async function startIMessageMode(): Promise<void> {
 
   stopSubscription = imessage.subscribe({
     onConnect: () => console.log("[atlas] event stream connected"),
-    onDisconnect: (reason) => console.warn(`[atlas] event stream disconnected: ${reason}`),
+    onDisconnect: (reason) => {
+      console.warn(`[atlas] event stream disconnected: ${reason}`);
+    },
     onError: (err) => {
-      if (appConfig.debug) console.error("[atlas] stream error:", err.message);
+      console.error("[atlas] stream error:", toErrorMessage(err));
     },
     onMessage: (event: SseEvent) => {
       if (event.type !== "inbound") return;
