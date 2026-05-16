@@ -20,20 +20,27 @@ function buildJxaScript(fromMs: number, toMs: number, calendarName: string): str
 function run() {
   var cal = Application("Calendar");
   var targetName = ${JSON.stringify(calendarName)};
-  var targetLower = targetName.toLowerCase();
+
+  // Normalize apostrophe variants (curly quotes U+2018/U+2019, backtick, etc.)
+  // to a plain straight apostrophe before comparing — macOS Calendar auto-curls them.
+  function normApos(s) {
+    return s.replace(/[\\u2018\\u2019\\u201a\\u201b\\u2032\\u2035\\u0060\\u00b4]/g, "'").toLowerCase();
+  }
+
+  var targetNorm = normApos(targetName);
 
   // List all calendar names for diagnostics
   var allCalendars = cal.calendars();
   var allNames = allCalendars.map(function(c) { try { return c.name(); } catch(e) { return ""; } });
 
-  // First try exact match, then case-insensitive fallback
+  // Exact match first, then normalized (case-insensitive + apostrophe-normalized) fallback
   var targetCal = null;
   for (var i = 0; i < allCalendars.length; i++) {
     if (allNames[i] === targetName) { targetCal = allCalendars[i]; break; }
   }
   if (!targetCal) {
     for (var i = 0; i < allCalendars.length; i++) {
-      if (allNames[i].toLowerCase() === targetLower) { targetCal = allCalendars[i]; break; }
+      if (normApos(allNames[i]) === targetNorm) { targetCal = allCalendars[i]; break; }
     }
   }
 
