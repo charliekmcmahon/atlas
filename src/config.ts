@@ -59,5 +59,10 @@ export const appConfig = {
   // How often the agent task scheduler polls for due tasks. If unset, falls back to reminderTickMs.
   agentTaskTickMs: process.env.AGENT_TASK_TICK_MS ? toPositiveInt(process.env.AGENT_TASK_TICK_MS, 30_000) : undefined,
 
+  // Apple Calendar integration
+  calendarName: process.env.CALENDAR_NAME?.trim() || "Charlie's Calendar",
+  calendarTickMs: toPositiveInt(process.env.CALENDAR_TICK_MS, 5 * 60_000),       // how often to sync (default 5 min)
+  calendarLookaheadHours: toPositiveInt(process.env.CALENDAR_LOOKAHEAD_HOURS, 48), // how far ahead to look
+
   debug: toBool(process.env.DEBUG, false),
 } as const;

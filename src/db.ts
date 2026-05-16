@@ -51,6 +51,27 @@ export interface AgentTask {
   cancelledAt: string | null;
 }
 
+export interface CalendarNotification {
+  id: number;
+  contact: string;
+  chatId: string | null;
+  eventUid: string;  // uid|startMs — unique per event occurrence
+  eventData: string; // JSON-serialised CalendarEvent snapshot
+  notifyAt: string;  // ISO — when to send the prep message
+  notifiedAt: string | null;
+  allDay: boolean;
+  createdAt: string;
+}
+
+interface RegisterCalendarEventInput {
+  contact: string;
+  chatId: string | null;
+  eventUid: string;
+  eventData: string;
+  notifyAt: string;
+  allDay: boolean;
+}
+
 interface IncomingMessageRecord {
   messageId: string;
   contact: string;
@@ -539,6 +560,66 @@ export class MemoryStore {
     return result.changes > 0;
   }
 
+  registerCalendarEvent(input: RegisterCalendarEventInput): boolean {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `
+      INSERT OR IGNORE INTO calendar_notifications (
+        contact, chat_id, event_uid, event_data, notify_at, all_day, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `
+    );
+    const result = stmt.run(
+      input.contact,
+      input.chatId,
+      input.eventUid,
+      input.eventData,
+      input.notifyAt,
+      input.allDay ? 1 : 0,
+      now
+    );
+    return result.changes > 0;
+  }
+
+  getDueCalendarNotifications(nowIso: string): CalendarNotification[] {
+    const stmt = this.db.prepare(
+      `
+      SELECT id, contact, chat_id, event_uid, event_data, notify_at, notified_at, all_day, created_at
+      FROM calendar_notifications
+      WHERE notified_at IS NULL
+        AND datetime(notify_at) <= datetime(?)
+      ORDER BY datetime(notify_at) ASC
+      `
+    );
+    const rows = stmt.all(nowIso) as Array<{
+      id: number;
+      contact: string;
+      chat_id: string | null;
+      event_uid: string;
+      event_data: string;
+      notify_at: string;
+      notified_at: string | null;
+      all_day: number;
+      created_at: string;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      contact: r.contact,
+      chatId: r.chat_id,
+      eventUid: r.event_uid,
+      eventData: r.event_data,
+      notifyAt: r.notify_at,
+      notifiedAt: r.notified_at,
+      allDay: Boolean(r.all_day),
+      createdAt: r.created_at,
+    }));
+  }
+
+  markCalendarNotificationSent(id: number, sentAtIso: string): void {
+    const stmt = this.db.prepare(`UPDATE calendar_notifications SET notified_at = ? WHERE id = ?`);
+    stmt.run(sentAtIso, id);
+  }
+
   close(): void {
     this.db.close();
   }
@@ -615,6 +696,23 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_agent_tasks_next_run
         ON agent_tasks(next_run_at)
         WHERE cancelled_at IS NULL AND next_run_at IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS calendar_notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contact TEXT NOT NULL,
+        chat_id TEXT,
+        event_uid TEXT NOT NULL,
+        event_data TEXT NOT NULL,
+        notify_at TEXT NOT NULL,
+        notified_at TEXT,
+        all_day INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        UNIQUE(contact, event_uid)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_calendar_notifications_due
+        ON calendar_notifications(notify_at)
+        WHERE notified_at IS NULL;
     `);
   }
 

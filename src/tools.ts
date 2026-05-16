@@ -1,6 +1,7 @@
 import { Type, type FunctionDeclaration, GoogleGenAI, ThinkingLevel } from "@google/genai";
 import type { MemoryStore, Reminder, UserProfile, AgentTask } from "./db.js";
 import { appConfig } from "./config.js";
+import { getUpcomingEvents, getTodaysEvents } from "./calendar.js";
 import { computeNextFromCron } from "./agent-tasks.js";
 
 const ai = new GoogleGenAI({ apiKey: appConfig.geminiApiKey });
@@ -117,6 +118,29 @@ export const toolDeclarations: FunctionDeclaration[] = [
     parameters: { type: Type.OBJECT, properties: { id: { type: Type.INTEGER } }, required: ["id"] },
   },
   {
+    name: "get_upcoming_events",
+    description:
+      "Get upcoming events from the user's Apple Calendar. Returns events starting within the next N hours. Use this when the user asks what's on their calendar, what they have coming up, or anything about their schedule.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        hours: {
+          type: Type.INTEGER,
+          description: "How many hours ahead to look. Default is 24. Max is 168 (one week).",
+        },
+      },
+    },
+  },
+  {
+    name: "get_todays_events",
+    description:
+      "Get all events on the user's Apple Calendar for today (from midnight to midnight local time). Use this when the user asks about today's schedule, plans for today, or what's on today.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {},
+    },
+  },
+  {
     name: "google_search",
     description: "Search Google and return structured top results and a short summary. The tool will perform the search and use the assistant to synthesize results.",
     parameters: {
@@ -163,6 +187,10 @@ export async function runToolCall(
       return handleListAgentTasks(ctx);
     case "cancel_agent_task":
       return handleCancelAgentTask(args, ctx);
+    case "get_upcoming_events":
+      return handleGetUpcomingEvents(args);
+    case "get_todays_events":
+      return handleGetTodaysEvents();
     case "google_search":
       return handleGoogleSearch(args, ctx);
     case "google_maps":
@@ -226,6 +254,37 @@ function handleCancelAgentTask(args: Record<string, unknown>, ctx: ToolContext):
   const cancelled = ctx.store.cancelAgentTask(ctx.contact, id);
   if (!cancelled) return { payload: { ok: false, error: `no active agent task with id ${id}` } };
   return { payload: { ok: true, id }, log: `cancelled agent task #${id}` };
+}
+
+function handleGetUpcomingEvents(args: Record<string, unknown>): ToolResult {
+  const hours = typeof args.hours === "number" && args.hours > 0 ? Math.min(168, Math.floor(args.hours)) : 24;
+  try {
+    const events = getUpcomingEvents(hours, appConfig.calendarName);
+    return {
+      payload: { ok: true, events, count: events.length },
+      log: `get_upcoming_events: ${events.length} events in next ${hours}h`,
+    };
+  } catch (error) {
+    return {
+      payload: { ok: false, error: toErrorMessage(error) },
+      log: `get_upcoming_events error: ${toErrorMessage(error)}`,
+    };
+  }
+}
+
+function handleGetTodaysEvents(): ToolResult {
+  try {
+    const events = getTodaysEvents(appConfig.calendarName);
+    return {
+      payload: { ok: true, events, count: events.length },
+      log: `get_todays_events: ${events.length} events today`,
+    };
+  } catch (error) {
+    return {
+      payload: { ok: false, error: toErrorMessage(error) },
+      log: `get_todays_events error: ${toErrorMessage(error)}`,
+    };
+  }
 }
 
 async function handleGoogleSearch(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {

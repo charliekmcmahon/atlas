@@ -19,6 +19,7 @@ import { buildSystemPrompt, buildUserContext } from "./prompt.js";
 import { ReminderScheduler } from "./scheduler.js";
 import { runToolCall, toolDeclarations } from "./tools.js";
 import { AgentTaskScheduler } from "./agent-tasks.js";
+import { CalendarWatcher } from "./calendar-watcher.js";
 import { IMessageClient, type IMessage, type SseEvent } from "./imessage-client.js";
 import { writeFileSync, existsSync, rmSync } from "node:fs";
 
@@ -46,6 +47,7 @@ let isShuttingDown = false;
 let stopSubscription: (() => void) | null = null;
 let scheduler: ReminderScheduler | null = null;
 let agentScheduler: AgentTaskScheduler | null = null;
+let calendarWatcher: CalendarWatcher | null = null;
 let queue: Promise<void> = Promise.resolve();
 
 function enqueue(task: () => Promise<void>): void {
@@ -460,6 +462,8 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
   cliInterface?.close();
   stopSubscription?.();
   scheduler?.stop();
+  agentScheduler?.stop();
+  calendarWatcher?.stop();
 
   await Promise.allSettled([queue, Promise.resolve().then(() => closeMemoryStore())]);
   process.exit(exitCode);
@@ -503,6 +507,34 @@ async function startIMessageMode(): Promise<void> {
   });
   agentScheduler.start();
   console.log(`[atlas] agent task scheduler started (tick: ${appConfig.agentTaskTickMs ?? appConfig.reminderTickMs}ms)`);
+
+  calendarWatcher = new CalendarWatcher({
+    store: memoryStore,
+    contact: allowedContact,
+    chatId: null,
+    calendarName: appConfig.calendarName,
+    geminiApiKey: appConfig.geminiApiKey,
+    geminiModel: appConfig.geminiModel,
+    lookaheadHours: appConfig.calendarLookaheadHours,
+    intervalMs: appConfig.calendarTickMs,
+    deliver: async (contact, chatId, text) => {
+      for (const chunk of splitForIMessage(text, appConfig.maxIMessageChunk)) {
+        await imessage.send(contact, chunk);
+        memoryStore.storeAssistantMessage({
+          messageId: createLocalMessageId(),
+          contact,
+          chatId,
+          text: chunk,
+          createdAt: new Date().toISOString(),
+        });
+      }
+    },
+    onError: (error, context) => {
+      console.error(`[atlas/calendar] ${context}:`, toErrorMessage(error));
+    },
+  });
+  calendarWatcher.start();
+  console.log(`[atlas] calendar watcher started (calendar: "${appConfig.calendarName}", tick: ${appConfig.calendarTickMs}ms, lookahead: ${appConfig.calendarLookaheadHours}h)`);
 
   // Pick the boot greeting:
   //   - post-reboot (reboot marker file exists) → "back online!"
