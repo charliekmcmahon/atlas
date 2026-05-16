@@ -19,11 +19,29 @@ function buildJxaScript(fromMs: number, toMs: number, calendarName: string): str
   return `
 function run() {
   var cal = Application("Calendar");
-  var calName = ${JSON.stringify(calendarName)};
-  var calendars = cal.calendars.whose({ name: calName });
+  var targetName = ${JSON.stringify(calendarName)};
+  var targetLower = targetName.toLowerCase();
 
-  if (calendars.length === 0) {
-    return JSON.stringify({ error: "calendar not found: " + calName });
+  // List all calendar names for diagnostics
+  var allCalendars = cal.calendars();
+  var allNames = allCalendars.map(function(c) { try { return c.name(); } catch(e) { return ""; } });
+
+  // First try exact match, then case-insensitive fallback
+  var targetCal = null;
+  for (var i = 0; i < allCalendars.length; i++) {
+    if (allNames[i] === targetName) { targetCal = allCalendars[i]; break; }
+  }
+  if (!targetCal) {
+    for (var i = 0; i < allCalendars.length; i++) {
+      if (allNames[i].toLowerCase() === targetLower) { targetCal = allCalendars[i]; break; }
+    }
+  }
+
+  if (!targetCal) {
+    return JSON.stringify({
+      error: "calendar not found: " + targetName,
+      availableCalendars: allNames.filter(function(n) { return n.length > 0; })
+    });
   }
 
   var from = ${fromMs};
@@ -32,7 +50,7 @@ function run() {
   var seen = {};
 
   try {
-    var allEvents = calendars[0].events();
+    var allEvents = targetCal.events();
     for (var i = 0; i < allEvents.length && i < 600; i++) {
       try {
         var evt = allEvents[i];
@@ -82,37 +100,53 @@ function run() {
 `;
 }
 
-export function getCalendarEvents(fromMs: number, toMs: number, calendarName: string): CalendarEvent[] {
-  const scriptPath = join(tmpdir(), `atlas-calendar-${process.pid}.js`);
-  const script = buildJxaScript(fromMs, toMs, calendarName);
+// Lists all calendar names visible to the Calendar app. Used at startup for diagnostics.
+function buildListCalendarsScript(): string {
+  return `
+function run() {
+  var cal = Application("Calendar");
+  var names = cal.calendars().map(function(c) { try { return c.name(); } catch(e) { return ""; } });
+  return JSON.stringify({ names: names.filter(function(n) { return n.length > 0; }) });
+}
+`;
+}
 
+function runJxaScript(script: string): unknown {
+  const scriptPath = join(tmpdir(), `atlas-calendar-${process.pid}-${Date.now()}.js`);
   try {
     writeFileSync(scriptPath, script, "utf-8");
-
     const raw = execFileSync("osascript", ["-l", "JavaScript", scriptPath], {
       timeout: 20_000,
       encoding: "utf-8",
     }).trim();
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      throw new Error(`calendar script returned non-JSON: ${raw.slice(0, 300)}`);
-    }
-
-    if (!parsed || typeof parsed !== "object") {
-      throw new Error("calendar script returned unexpected value");
-    }
-
-    const record = parsed as { error?: unknown; events?: unknown };
-    if (record.error) throw new Error(String(record.error));
-    if (!Array.isArray(record.events)) return [];
-
-    return record.events.filter(isValidCalendarEvent);
+    return JSON.parse(raw);
   } finally {
     try { unlinkSync(scriptPath); } catch { /* ignore */ }
   }
+}
+
+export function listCalendarNames(): string[] {
+  try {
+    const result = runJxaScript(buildListCalendarsScript()) as { names?: string[] };
+    return Array.isArray(result?.names) ? result.names : [];
+  } catch {
+    return [];
+  }
+}
+
+export function getCalendarEvents(fromMs: number, toMs: number, calendarName: string): CalendarEvent[] {
+  const script = buildJxaScript(fromMs, toMs, calendarName);
+  const parsed = runJxaScript(script) as { error?: unknown; availableCalendars?: string[]; events?: unknown };
+
+  if (parsed.error) {
+    const hint = Array.isArray(parsed.availableCalendars) && parsed.availableCalendars.length > 0
+      ? ` (available: ${parsed.availableCalendars.join(", ")})`
+      : "";
+    throw new Error(String(parsed.error) + hint);
+  }
+
+  if (!Array.isArray(parsed.events)) return [];
+  return parsed.events.filter(isValidCalendarEvent);
 }
 
 export function getUpcomingEvents(hoursAhead: number, calendarName: string): CalendarEvent[] {

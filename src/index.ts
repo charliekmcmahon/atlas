@@ -20,6 +20,7 @@ import { ReminderScheduler } from "./scheduler.js";
 import { runToolCall, toolDeclarations } from "./tools.js";
 import { AgentTaskScheduler } from "./agent-tasks.js";
 import { CalendarWatcher } from "./calendar-watcher.js";
+import { listCalendarNames } from "./calendar.js";
 import { IMessageClient, type IMessage, type SseEvent } from "./imessage-client.js";
 import { writeFileSync, existsSync, rmSync } from "node:fs";
 
@@ -41,6 +42,22 @@ const imessage = new IMessageClient({
   apiKey: appConfig.imessageApiKey,
 });
 
+// Per-message-batch task with cancellation support.
+// When a new message arrives while one is in-flight, the current task is cancelled
+// (its reply suppressed) and a new task starts with all messages combined.
+interface ActiveTask {
+  readonly id: number;
+  readonly contact: string;
+  messages: Array<{
+    messageId: string;
+    chatId: string | null;
+    text: string;
+    hasAttachments: boolean;
+    createdAt: string;
+  }>;
+  cancelled: boolean;
+}
+
 let cliInterface: ReadlineInterface | null = null;
 let memoryClosed = false;
 let isShuttingDown = false;
@@ -48,107 +65,145 @@ let stopSubscription: (() => void) | null = null;
 let scheduler: ReminderScheduler | null = null;
 let agentScheduler: AgentTaskScheduler | null = null;
 let calendarWatcher: CalendarWatcher | null = null;
-let queue: Promise<void> = Promise.resolve();
-
-function enqueue(task: () => Promise<void>): void {
-  queue = queue.then(task).catch((error: unknown) => {
-    console.error("[atlas] task failed:", toErrorMessage(error));
-  });
-}
+let taskSeq = 0;
+let activeTask: ActiveTask | null = null;
+let processingChain: Promise<void> = Promise.resolve();
 
 function questionAsync(rl: ReadlineInterface, prompt: string): Promise<string> {
   return new Promise((resolve) => rl.question(prompt, resolve));
 }
 
-async function handleInbound(message: IMessage): Promise<void> {
-  const contact = message.participant;
+// Synchronous entry point from the SSE stream. All filtering and command handling
+// happens here before any async work, so there are no race conditions.
+function handleInboundEvent(msg: IMessage): void {
+  const contact = msg.participant;
   if (!contact) return;
   if (appConfig.allowedContact && normalizeContact(contact) !== normalizeContact(appConfig.allowedContact)) {
-    if (appConfig.debug) {
-      console.log(`[atlas] ignoring inbound from non-allowed contact: ${contact}`);
-    }
+    if (appConfig.debug) console.log(`[atlas] ignoring inbound from non-allowed contact: ${contact}`);
     return;
   }
 
-  const text = message.text ?? "";
+  const text = msg.text ?? "";
   if (!text.trim()) return;
 
-  // Built-in chat commands take precedence over Gemini.
-  if (await maybeHandleCommand(contact, text)) return;
+  // Known control commands run immediately, bypassing the task queue.
+  const cmd = text.trim().toLowerCase();
+  if (cmd === "/reboot") {
+    void handleReboot(contact);
+    return;
+  }
+  if (cmd === "/ping") {
+    void imessage.send(contact, "pong").catch((err) => console.error("[atlas] pong failed:", toErrorMessage(err)));
+    return;
+  }
 
-  const messageId = message.id ?? `row-${message.rowId}`;
-  const nowIso = message.createdAt ?? new Date().toISOString();
-
-  const inserted = memoryStore.registerIncomingMessage({
-    messageId,
-    contact,
-    chatId: message.chatId,
+  const pending = {
+    messageId: msg.id ?? `row-${msg.rowId}`,
+    chatId: msg.chatId,
     text,
-    hasAttachments: message.hasAttachments,
-    createdAt: nowIso,
+    hasAttachments: msg.hasAttachments ?? false,
+    createdAt: msg.createdAt ?? new Date().toISOString(),
+  };
+
+  if (activeTask && !activeTask.cancelled) {
+    // A reply is still being generated. Cancel it and fold this message into the batch.
+    if (appConfig.debug) {
+      console.log(`[atlas] batching "${text.slice(0, 50)}" with in-flight task #${activeTask.id}`);
+    }
+    activeTask.cancelled = true;
+    const batchMessages = [...activeTask.messages, pending];
+    spawnTask(contact, batchMessages);
+  } else {
+    spawnTask(contact, [pending]);
+  }
+}
+
+async function handleReboot(contact: string): Promise<void> {
+  console.log("[atlas] /reboot received — restarting");
+  const rebootMarkerPath = `${appConfig.dbPath}.reboot-marker`;
+  try { writeFileSync(rebootMarkerPath, String(Date.now()), "utf-8"); } catch { /* ignore */ }
+  try { await imessage.send(contact, "rebooting..."); } catch { /* ignore */ }
+  void shutdown("reboot", 42);
+}
+
+function spawnTask(contact: string, messages: ActiveTask["messages"]): void {
+  const task: ActiveTask = { id: ++taskSeq, contact, messages, cancelled: false };
+  activeTask = task;
+  processingChain = processingChain.then(async () => {
+    if (task.cancelled) return;
+    try {
+      await executeTask(task);
+    } catch (error) {
+      console.error(`[atlas] task #${task.id} failed:`, toErrorMessage(error));
+    } finally {
+      if (activeTask === task) activeTask = null;
+    }
   });
+}
 
-  if (!inserted) return; // already processed
+async function executeTask(task: ActiveTask): Promise<void> {
+  if (task.cancelled) return;
 
-  memoryStore.extractAndStoreMemories(contact, text, messageId);
-  memoryStore.markMessageRead(messageId, new Date().toISOString());
+  const { contact, messages } = task;
+  const chatId = messages[messages.length - 1].chatId;
 
-  const reply = await generateAssistantReply(contact, message.chatId, text, []);
+  // Register messages in DB. INSERT OR IGNORE keeps this idempotent if the same
+  // message arrives again (e.g., SSE reconnect) or was already registered by a
+  // cancelled predecessor task.
+  for (const msg of messages) {
+    const inserted = memoryStore.registerIncomingMessage({
+      messageId: msg.messageId,
+      contact,
+      chatId: msg.chatId,
+      text: msg.text,
+      hasAttachments: msg.hasAttachments,
+      createdAt: msg.createdAt,
+    });
+    if (inserted) {
+      memoryStore.extractAndStoreMemories(contact, msg.text, msg.messageId);
+      memoryStore.markMessageRead(msg.messageId, new Date().toISOString());
+    }
+  }
+
+  if (task.cancelled) return;
+
+  // Multiple quick messages are presented as a numbered list so the model can
+  // address all of them in one reply.
+  const latestUserText = messages.length === 1
+    ? messages[0].text
+    : messages.map((m, i) => `[${i + 1}] ${m.text}`).join("\n");
+
+  const reply = await generateAssistantReply(contact, chatId, latestUserText, [], task);
+
+  if (task.cancelled) {
+    console.log(`[atlas] task #${task.id} cancelled after Gemini — reply suppressed`);
+    return;
+  }
+
+  // SILENT means the model decided the message doesn't need a reply.
+  if (reply.trim() === "SILENT") {
+    if (appConfig.debug) console.log(`[atlas] task #${task.id}: no reply needed (SILENT)`);
+    return;
+  }
 
   for (const chunk of splitForIMessage(reply, appConfig.maxIMessageChunk)) {
     await imessage.send(contact, chunk);
     memoryStore.storeAssistantMessage({
       messageId: createLocalMessageId(),
       contact,
-      chatId: message.chatId,
+      chatId,
       text: chunk,
       createdAt: new Date().toISOString(),
     });
   }
 }
 
-// Inbound text starting with "/" is treated as a control command, not a prompt.
-// Returns true if the text was handled (no Gemini reply should follow).
-async function maybeHandleCommand(contact: string, rawText: string): Promise<boolean> {
-  const cmd = rawText.trim().toLowerCase();
-  if (!cmd.startsWith("/")) return false;
-
-  if (cmd === "/reboot") {
-    console.log("[atlas] /reboot received — pulling latest code and restarting");
-    try {
-      // Mark this as a reboot so the next startup sends "back online!"
-      const rebootMarkerPath = `${appConfig.dbPath}.reboot-marker`;
-      try {
-        writeFileSync(rebootMarkerPath, String(Date.now()), "utf-8");
-      } catch (err) {
-        console.warn("[atlas] could not write reboot marker:", toErrorMessage(err));
-      }
-      await imessage.send(contact, "rebooting...");
-    } catch (error) {
-      console.error("[atlas] could not send reboot ack:", toErrorMessage(error));
-    }
-    void shutdown("reboot", 42);
-    return true;
-  }
-
-  if (cmd === "/ping") {
-    try {
-      await imessage.send(contact, "pong");
-    } catch (error) {
-      console.error("[atlas] could not send pong:", toErrorMessage(error));
-    }
-    return true;
-  }
-
-  // Unknown slash command — let it fall through to Gemini so the user gets feedback.
-  return false;
-}
-
 async function generateAssistantReply(
   contact: string,
   chatId: string | null,
   latestUserText: string,
-  attachments: readonly AttachmentInput[]
+  attachments: readonly AttachmentInput[],
+  task?: ActiveTask
 ): Promise<string> {
   const { parts: attachmentParts, summaries } = await buildAttachmentParts(attachments);
 
@@ -169,6 +224,9 @@ async function generateAssistantReply(
   let finalText = "";
 
   for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
+    // Check cancellation before each Gemini call so we bail as early as possible.
+    if (task?.cancelled) return "";
+
     const response = await ai.models.generateContent({
       model: appConfig.geminiModel,
       config: {
@@ -465,7 +523,7 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
   agentScheduler?.stop();
   calendarWatcher?.stop();
 
-  await Promise.allSettled([queue, Promise.resolve().then(() => closeMemoryStore())]);
+  await Promise.allSettled([processingChain, Promise.resolve().then(() => closeMemoryStore())]);
   process.exit(exitCode);
 }
 
@@ -507,6 +565,14 @@ async function startIMessageMode(): Promise<void> {
   });
   agentScheduler.start();
   console.log(`[atlas] agent task scheduler started (tick: ${appConfig.agentTaskTickMs ?? appConfig.reminderTickMs}ms)`);
+
+  // Log available calendars at startup to help diagnose name mismatches.
+  try {
+    const calNames = listCalendarNames();
+    console.log(`[atlas] available calendars: ${calNames.length > 0 ? calNames.join(", ") : "(none found — check Calendar app permissions)"}`);
+  } catch (err) {
+    console.warn("[atlas] could not list calendars:", toErrorMessage(err));
+  }
 
   calendarWatcher = new CalendarWatcher({
     store: memoryStore,
@@ -585,7 +651,7 @@ async function startIMessageMode(): Promise<void> {
           `[atlas] inbound rowid=${msg.rowId} text="${(msg.text ?? "").slice(0, 60)}"`
         );
       }
-      enqueue(() => handleInbound(msg));
+      handleInboundEvent(msg);
     },
   });
 
